@@ -356,7 +356,7 @@ fn check_potential_copy_start(
                     to,
                     cpu: mem_access.cpu as usize,
                     size: copy.size,
-                    current_from: mem_access.address + 1 << mem_access.size,
+                    current_from: mem_access.address + (1 << mem_access.size),
                     current_to: to,
                 });
                 potential_copy = true;
