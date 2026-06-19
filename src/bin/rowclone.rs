@@ -62,6 +62,7 @@ struct MemCpy {
 
 struct RowcloneEvent {
     target_global_idx: usize,
+    end_global_idx: usize,
     cpu: usize,
     insn_count: u64,
     from: u64,
@@ -224,6 +225,7 @@ fn track_active_copies(
                 }
                 rowclone_events.push(RowcloneEvent {
                     target_global_idx: active_copies[idx].first_global_idx,
+                    end_global_idx: global_idx,
                     cpu: active_copies[idx].cpu,
                     insn_count: active_copies[idx].first_insn_count,
                     from: active_copies[idx].from,
@@ -306,6 +308,7 @@ fn match_copy_to_mem_accesses<W1: Write, W2: Write>(
     copy_window: &mut Vec<KernelRecord>,
     rowclone_output: &mut BufWriter<W1>,
     baseline_output: &mut BufWriter<W2>,
+    crop_bounds: bool,
 ) {
     let mut active_copies: Vec<MemCpy> = vec![];
     let mut valid_indices = vec![false; baseline_history.len()];
@@ -331,9 +334,23 @@ fn match_copy_to_mem_accesses<W1: Write, W2: Write>(
         current_global_idx += 1;
     }
 
+    let (start_bound, end_bound) = if crop_bounds && !rowclone_events.is_empty() {
+        let first_idx = rowclone_events.iter().map(|e| e.target_global_idx).min().unwrap_or(0);
+        let last_idx = rowclone_events.iter().map(|e| e.end_global_idx).max().unwrap_or(baseline_history.len());
+        eprintln!("Option CROP active. Bornes détectées : [{} à {}]", first_idx, last_idx);
+        (first_idx, last_idx)
+    } else {
+        (0, baseline_history.len())
+    };
+
     eprintln!("Génération finale du fichier...");
     let mut final_rowclones = 0;
     for (idx, mem_access) in baseline_history.iter().enumerate() {
+
+        if idx < start_bound || idx > end_bound {
+            continue;
+        }
+
         print_regular_access(mem_access, baseline_output);
         if valid_indices[idx] {
             if let Some(event) = rowclone_events.iter().find(|e| e.target_global_idx == idx) {
@@ -354,6 +371,7 @@ pub fn add_rowclone_info(
     kernel_logfile: &str,
     rowclone_output_file: &str,
     baseline_output_file: &str,
+    crop_bounds: bool,
 ) -> io::Result<()> {
 
     eprintln!("Passe 1 : Chargement de la trace mémoire...");
@@ -380,7 +398,7 @@ pub fn add_rowclone_info(
         .collect();
     
     eprintln!("Passe 2 : Analyse et filtrage...");
-    match_copy_to_mem_accesses(baseline_history, lines, &mut copy_window, &mut rc_writer, &mut bl_writer);
+    match_copy_to_mem_accesses(baseline_history, lines, &mut copy_window, &mut rc_writer, &mut bl_writer, crop_bounds);
 
     eprintln!("Unmatched Rowclones: {}", copy_window.len());
     let _ = rc_writer.flush();
@@ -398,6 +416,9 @@ struct Args {
 
     #[arg(short, long)]
     baseline_file: String,
+
+    #[arg(short, long, default_value_t = false)]
+    crop: bool,
 }
 
 fn main() {
