@@ -13,7 +13,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const COPY_WINDOW: usize = 200;
 const COPY_WINDOW_STALE_THRESHOLD: usize = 20;
 const COPY_CONFIDENCE_THRESHOLD: u64 = 128;
-const COPY_CONFIDENCE_WINDOW: usize = 200000;
 
 static NEXT_KERNEL_REC_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -27,8 +26,6 @@ struct KernelRecord {
     user_address: u64,
     stale: usize,
 }
-
-type AddrMap<T> = HashMap<u64, Vec<T>>;
 
 static KERNEL_LOG_PATTERN: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"([^\s]+)\s+\[(\d+)\].*rowclone_(read|write):\s+\[RC\]\s+(0x[0-9a-fA-F]+)\s+(0x[0-9a-fA-F]+)"#).expect("failed to compile regex")
@@ -91,10 +88,6 @@ fn parse_kernel_line(line: &str) -> Option<KernelRecord> {
     }
 }
 
-fn page_number(address: u64) -> u64 {
-    address & !0xFFF
-}
-
 fn mem_copy_match(mem_access: &log_parser::LogRecord, copy: &MemCpy) -> bool {
     (copy.current_from == mem_access.address && mem_access.store == 0)
         || (copy.current_to == mem_access.address && mem_access.store == 1)
@@ -143,7 +136,7 @@ fn push_ongoing_copy(
     ongoing_copies.push(copy);
 }
 
-fn print_rowclone(copy: &MemCpy, output: &mut BufWriter<std::io::Stdout>) {
+fn print_rowclone<W: Write>(copy: &MemCpy, output: &mut BufWriter<W>) {
     writeln!(
         output,
         "{}",
@@ -156,9 +149,9 @@ fn print_rowclone(copy: &MemCpy, output: &mut BufWriter<std::io::Stdout>) {
     );
 }
 
-fn print_regular_access(
+fn print_regular_access<W: Write>(
     mem_access: &log_parser::LogRecord,
-    output: &mut BufWriter<std::io::Stdout>,
+    output: &mut BufWriter<W>,
 ) {
     writeln!(
         output,
@@ -217,14 +210,14 @@ fn copy_matched(potential_copies: &Vec<MemCpy>, idx: usize) -> bool {
     (copy.current_to - copy.to) > COPY_CONFIDENCE_THRESHOLD
         && (copy.current_from - copy.from) > COPY_CONFIDENCE_THRESHOLD
 }
-fn part_of_potential_copy(
+fn part_of_potential_copy<W: Write>(
     mem_access: &log_parser::LogRecord,
     potential_copies: &mut Vec<MemCpy>,
     ongoing_copies: &mut Vec<MemCpy>,
     rowclones: &mut usize,
     copy_window: &mut Vec<KernelRecord>,
     copy_logs: &mut impl Iterator<Item = io::Result<String>>,
-    output: &mut BufWriter<std::io::Stdout>,
+    output: &mut BufWriter<W>,
 ) -> bool {
     let mut potential_copy = false;
     let mut matches: Vec<usize> = vec![];
@@ -313,11 +306,11 @@ fn check_potential_copy_start(
     potential_copy
 }
 
-fn match_copy_to_mem_accesses(
+fn match_copy_to_mem_accesses<W: Write>(
     mem_reader: BufReader<std::io::Stdin>,
     mut copy_logs: impl Iterator<Item = io::Result<String>>,
     copy_window: &mut Vec<KernelRecord>,
-    output: &mut BufWriter<std::io::Stdout>,
+    output: &mut BufWriter<W>,
 ) {
     let mut ongoing_copies: Vec<MemCpy> = vec![];
     let mut potential_copies: Vec<MemCpy> = vec![];
@@ -355,10 +348,12 @@ fn match_copy_to_mem_accesses(
 pub fn add_rowclone_info(
     mem_reader: BufReader<std::io::Stdin>,
     kernel_logfile: &str,
+    rowclone_output_file: &str,
 ) -> io::Result<()> {
 
     let kernel_log = File::open(kernel_logfile)?;
-    let mut writer = BufWriter::new(std::io::stdout());
+    let rowclone_file = File::create(rowclone_output_file)?;
+    let mut writer = BufWriter::new(rowclone_file);
     let reader = BufReader::new(kernel_log);
     let mut lines = reader.lines();
     let mut copy_window = lines
@@ -381,12 +376,15 @@ pub fn add_rowclone_info(
 struct Args {
     #[arg(short, long)]
     kernel_logfile: String,
+
+    #[arg(short, long)]
+    output_file: String,
 }
 
 fn main() {
     let args = Args::parse();
     let reader = BufReader::new(std::io::stdin());
-    if add_rowclone_info(reader, &args.kernel_logfile).is_ok() {
+    if add_rowclone_info(reader, &args.kernel_logfile, &args.output_file).is_ok() {
         eprintln!("Finished adding rowclone info");
     } else {
         eprintln!("Error adding rowclone info");
