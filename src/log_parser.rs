@@ -8,6 +8,7 @@ use std::mem;
 use std::str::FromStr;
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct LogRecord {
     pub logical_clock: u64,
     pub insn_count: u64,
