@@ -424,7 +424,7 @@ struct Args {
 fn main() {
     let args = Args::parse();
     let reader = BufReader::new(std::io::stdin());
-    if add_rowclone_info(reader, &args.kernel_logfile, &args.output_file, &args.baseline_file).is_ok() {
+    if add_rowclone_info(reader, &args.kernel_logfile, &args.output_file, &args.baseline_file, args.crop).is_ok() {
         eprintln!("Finished adding rowclone info");
     } else {
         eprintln!("Error adding rowclone info");
