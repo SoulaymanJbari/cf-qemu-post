@@ -300,11 +300,12 @@ fn check_potential_copy_start(
     potential_copy
 }
 
-fn match_copy_to_mem_accesses<W: Write>(
+fn match_copy_to_mem_accesses<W1: Write, W2: Write>(
     baseline_history: Vec<log_parser::LogRecord>,
     mut copy_logs: impl Iterator<Item = io::Result<String>>,
     copy_window: &mut Vec<KernelRecord>,
-    output: &mut BufWriter<W>,
+    rowclone_output: &mut BufWriter<W1>,
+    baseline_output: &mut BufWriter<W2>,
 ) {
     let mut active_copies: Vec<MemCpy> = vec![];
     let mut valid_indices = vec![false; baseline_history.len()];
@@ -333,14 +334,15 @@ fn match_copy_to_mem_accesses<W: Write>(
     eprintln!("Génération finale du fichier...");
     let mut final_rowclones = 0;
     for (idx, mem_access) in baseline_history.iter().enumerate() {
+        print_regular_access(mem_access, baseline_output);
         if valid_indices[idx] {
             if let Some(event) = rowclone_events.iter().find(|e| e.target_global_idx == idx) {
-                print_rowclone(event, output);
+                print_rowclone(event, rowclone_output);
                 final_rowclones += 1;
             }
             continue;
         }
-        print_regular_access(mem_access, output);
+        print_regular_access(mem_access, rowclone_output);
     }
 
     eprintln!("Rowclones validated: {}", final_rowclones);
@@ -351,6 +353,7 @@ pub fn add_rowclone_info(
     mem_reader: BufReader<std::io::Stdin>,
     kernel_logfile: &str,
     rowclone_output_file: &str,
+    baseline_output_file: &str,
 ) -> io::Result<()> {
 
     eprintln!("Passe 1 : Chargement de la trace mémoire...");
@@ -362,7 +365,9 @@ pub fn add_rowclone_info(
 
     let kernel_log = File::open(kernel_logfile)?;
     let rowclone_file = File::create(rowclone_output_file)?;
-    let mut writer = BufWriter::new(rowclone_file);
+    let mut rc_writer = BufWriter::new(rowclone_file);
+    let baseline_file = File::create(baseline_output_file)?;
+    let mut bl_writer = BufWriter::new(baseline_file);
     let reader = BufReader::new(kernel_log);
     let mut lines = reader.lines();
     let mut copy_window = lines
@@ -375,10 +380,11 @@ pub fn add_rowclone_info(
         .collect();
     
     eprintln!("Passe 2 : Analyse et filtrage...");
-    match_copy_to_mem_accesses(baseline_history, lines, &mut copy_window, &mut writer);
+    match_copy_to_mem_accesses(baseline_history, lines, &mut copy_window, &mut rc_writer, &mut bl_writer);
 
     eprintln!("Unmatched Rowclones: {}", copy_window.len());
-    let _ = writer.flush();
+    let _ = rc_writer.flush();
+    let _ = bl_writer.flush();
     Ok(())
 }
 #[derive(Parser, Debug)]
@@ -389,12 +395,15 @@ struct Args {
 
     #[arg(short, long)]
     output_file: String,
+
+    #[arg(short, long)]
+    baseline_file: String,
 }
 
 fn main() {
     let args = Args::parse();
     let reader = BufReader::new(std::io::stdin());
-    if add_rowclone_info(reader, &args.kernel_logfile, &args.output_file).is_ok() {
+    if add_rowclone_info(reader, &args.kernel_logfile, &args.output_file, &args.baseline_file).is_ok() {
         eprintln!("Finished adding rowclone info");
     } else {
         eprintln!("Error adding rowclone info");
