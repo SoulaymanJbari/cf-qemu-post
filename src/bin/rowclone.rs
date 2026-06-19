@@ -12,7 +12,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 const COPY_WINDOW: usize = 200;
 const COPY_WINDOW_STALE_THRESHOLD: usize = 20;
-const COPY_CONFIDENCE_THRESHOLD: u64 = 128;
 
 static NEXT_KERNEL_REC_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -202,88 +201,40 @@ fn remove_stale_copies(
     }
 }
 
-fn part_of_ongoing_copy(
+fn track_active_copies(
     mem_access: &log_parser::LogRecord,
-    ongoing_copies: &mut Vec<MemCpy>,
+    active_copies: &mut Vec<MemCpy>,
     global_idx: usize,
     valid_indices: &mut Vec<bool>,
     rowclone_events: &mut Vec<RowcloneEvent>,
+    copy_window: &mut Vec<KernelRecord>,
+    copy_logs: &mut impl Iterator<Item = io::Result<String>>,
 ) -> bool {
-    for (idx, copy) in ongoing_copies.iter().enumerate() {
-        if mem_copy_match(mem_access, copy) {
-            let done = update_copy(ongoing_copies, idx, &mem_access, global_idx);
+    for idx in 0..active_copies.len() {
+        if mem_copy_match(mem_access, &active_copies[idx]) {
+            let done = update_copy(active_copies, idx, mem_access, global_idx);
             if done {
-                for &saved_idx in &ongoing_copies[idx].associated_indices {
+                eprintln!("Rowclone finished!");
+                let rec_id = active_copies[idx].rec_id;
+                copy_window.retain(|i| i.rec_id != rec_id);
+                remove_stale_copies(rec_id, copy_window, copy_logs);
+
+                for &saved_idx in &active_copies[idx].associated_indices {
                     valid_indices[saved_idx] = true;
                 }
                 rowclone_events.push(RowcloneEvent {
-                    target_global_idx: ongoing_copies[idx].first_global_idx,
-                    cpu: ongoing_copies[idx].cpu,
-                    insn_count: ongoing_copies[idx].first_insn_count,
-                    from: ongoing_copies[idx].from,
-                    to: ongoing_copies[idx].to,
+                    target_global_idx: active_copies[idx].first_global_idx,
+                    cpu: active_copies[idx].cpu,
+                    insn_count: active_copies[idx].first_insn_count,
+                    from: active_copies[idx].from,
+                    to: active_copies[idx].to,
                 });
-                ongoing_copies.remove(idx);
+                active_copies.remove(idx);
             }
             return true;
         }
     }
     false
-}
-
-fn copy_matched(potential_copies: &Vec<MemCpy>, idx: usize) -> bool {
-    let copy = &potential_copies[idx];
-    (copy.current_to - copy.to) > COPY_CONFIDENCE_THRESHOLD
-        && (copy.current_from - copy.from) > COPY_CONFIDENCE_THRESHOLD
-}
-fn part_of_potential_copy(
-    mem_access: &log_parser::LogRecord,
-    potential_copies: &mut Vec<MemCpy>,
-    ongoing_copies: &mut Vec<MemCpy>,
-    rowclones: &mut usize,
-    copy_window: &mut Vec<KernelRecord>,
-    copy_logs: &mut impl Iterator<Item = io::Result<String>>,
-    global_idx: usize,
-    valid_indices: &mut Vec<bool>,
-    rowclone_events: &mut Vec<RowcloneEvent>,
-) -> bool {
-    let mut potential_copy = false;
-    let mut matches: Vec<usize> = vec![];
-    for (idx, copy) in potential_copies.iter().enumerate() {
-        if mem_copy_match(mem_access, copy) {
-            potential_copy = true;
-            matches.push(idx);
-        }
-    }
-    for idx in matches.iter().rev() {
-        let done = update_copy(potential_copies, *idx, &mem_access, global_idx);
-        if done {
-            eprintln!("new rowclone");
-            *rowclones += 1;
-            let rec_id = potential_copies[*idx].rec_id;
-            copy_window.retain(|i| i.rec_id != rec_id);
-            remove_stale_copies(rec_id, copy_window, copy_logs);
-            for &saved_idx in &potential_copies[*idx].associated_indices {
-                valid_indices[saved_idx] = true;
-            }
-            rowclone_events.push(RowcloneEvent {
-                target_global_idx: potential_copies[*idx].first_global_idx,
-                cpu: potential_copies[*idx].cpu,
-                insn_count: potential_copies[*idx].first_insn_count,
-                from: potential_copies[*idx].from,
-                to: potential_copies[*idx].to,
-            });
-            potential_copies.remove(*idx);
-        } else if copy_matched(potential_copies, *idx) {
-            eprintln!("new rowclone");
-            *rowclones += 1;
-            let rec_id = potential_copies[*idx].rec_id;
-            copy_window.retain(|i| i.rec_id != rec_id);
-            remove_stale_copies(rec_id, copy_window, copy_logs);
-            push_ongoing_copy(ongoing_copies, potential_copies, *idx);
-        }
-    }
-    potential_copy
 }
 
 fn check_potential_copy_start(
@@ -355,31 +306,24 @@ fn match_copy_to_mem_accesses<W: Write>(
     copy_window: &mut Vec<KernelRecord>,
     output: &mut BufWriter<W>,
 ) {
-    let mut ongoing_copies: Vec<MemCpy> = vec![];
-    let mut potential_copies: Vec<MemCpy> = vec![];
+    let mut active_copies: Vec<MemCpy> = vec![];
     let mut valid_indices = vec![false; baseline_history.len()];
     let mut rowclone_events: Vec<RowcloneEvent> = vec![];
     let mut mem_accesses = LookaheadIterator::new(baseline_history.iter());
-    let mut rowclones = 0;
     let mut current_global_idx = 0;
     while let Some(mem_access) = mem_accesses.next() {
-        if part_of_ongoing_copy(&mem_access, &mut ongoing_copies, current_global_idx, &mut valid_indices, &mut rowclone_events) {
-            current_global_idx += 1;
-            continue;
-        } else if part_of_potential_copy(
+       if track_active_copies(
             &mem_access,
-            &mut potential_copies,
-            &mut ongoing_copies,
-            &mut rowclones,
-            copy_window,
-            &mut copy_logs,
+            &mut active_copies,
             current_global_idx,
             &mut valid_indices,
             &mut rowclone_events,
+            copy_window,
+            &mut copy_logs
         ) {
             current_global_idx += 1;
             continue;
-        } else if check_potential_copy_start(&mem_access, &copy_window, &mut potential_copies, current_global_idx) {
+        } else if check_potential_copy_start(&mem_access, copy_window, &mut active_copies, current_global_idx) {
             current_global_idx += 1;
             continue;
         }
@@ -387,19 +331,20 @@ fn match_copy_to_mem_accesses<W: Write>(
     }
 
     eprintln!("Génération finale du fichier...");
+    let mut final_rowclones = 0;
     for (idx, mem_access) in baseline_history.iter().enumerate() {
         if valid_indices[idx] {
             if let Some(event) = rowclone_events.iter().find(|e| e.target_global_idx == idx) {
                 print_rowclone(event, output);
+                final_rowclones += 1;
             }
             continue;
         }
         print_regular_access(mem_access, output);
     }
 
-    eprintln!("Rowclones matched: {}", rowclones);
-    eprintln!("Potential copies: {}", potential_copies.len());
-    eprintln!("Unfinished copies: {}", ongoing_copies.len());
+    eprintln!("Rowclones validated: {}", final_rowclones);
+    eprintln!("Rowclones uncompleted: {}", active_copies.len());
 }
 
 pub fn add_rowclone_info(
