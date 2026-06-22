@@ -115,14 +115,18 @@ fn update_copy(
     global_idx: usize,
 ) -> bool {
     let access_size_bytes = 1 << mem_access.size;
+    let current_cpu = mem_access.cpu as usize;
     let copy = &mut copies[copy_idx];
     if mem_access.store == 1 {
         copy.current_to += access_size_bytes;
     } else {
         copy.current_from += access_size_bytes;
     }
+    if copy.cpu != current_cpu {
+        copy.first_insn_count = mem_access.insn_count;
+    }
     copy.insn_count = mem_access.insn_count;
-    copy.cpu = mem_access.cpu as usize;
+    copy.cpu = current_cpu;
     copy.associated_indices.push(global_idx);
     copy_done(&copy)
 }
