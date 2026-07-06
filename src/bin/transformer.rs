@@ -26,11 +26,8 @@ fn parse_binary_record(line: &str) -> Result<MemoryAccess, Box<dyn std::error::E
 #[derive(Parser, Debug)]
 #[command(about)]
 struct Args {
-    // Whether the input logs are in binary format
     #[arg(short, long, default_value_t = false)]
     binary_in: bool,
-
-    // the number of CPUs
     #[arg(short, long, default_value_t = 8)]
     cpus: usize,
 
@@ -53,9 +50,7 @@ fn ramulator_mem_format(rec: &MemRecord, prev_insn_count: &u64) -> String {
 
 fn main() {
     let args = Args::parse();
-    let reader = BufReader::new(std::io::stdin());
-    
-    // Initialisation des fichiers de sortie par CPU
+    let reader = BufReader::new(std::io::stdin()); 
     let mut writers: Vec<BufWriter<std::fs::File>> = (0..args.cpus)
         .map(|cpu_id| {
             let filename = format!("{}/cpu_{}.trace", args.log_dir, cpu_id);
@@ -83,9 +78,7 @@ fn main() {
                     if first[cpu] {
                         prev_insn_count[cpu] = mem.insn_count;
                         first[cpu] = false;
-                    }
-                    
-                    // On écrit TOUS les accès directement dans le format Ramulator
+                    }                
                     let _ = writeln!(
                         writers[cpu],
                         "{}",
@@ -99,9 +92,7 @@ fn main() {
                     if first[cpu] {
                         prev_insn_count[cpu] = rc.insn_count;
                         first[cpu] = false;
-                    }
-                    
-                    // On écrit les accès Rowclone directement (sans invalidation de cache)
+                    }                
                     let _ = writeln!(
                         writers[cpu],
                         "{} 0x{:016x} 0x{:016x}",
