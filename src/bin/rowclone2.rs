@@ -110,7 +110,7 @@ fn mem_copy_match(mem_access: &log_parser::LogRecord, copy: &MemCpy) -> bool {
 }
 
 fn copy_done(copy: &MemCpy) -> bool {
-    copy.current_from >= copy.from + copy.size && copy.current_to >= copy.to + copy.size
+    copy.current_to >= copy.to + copy.size
 }
 
 fn update_copy(
@@ -122,23 +122,18 @@ fn update_copy(
     let access_size_bytes = 1 << mem_access.size;
     let current_cpu = mem_access.cpu as usize;
     let copy = &mut copies[copy_idx];
-
     if mem_access.store == 1 {
         copy.current_to += access_size_bytes;
-        copy.associated_indices.push(global_idx);
-        copy.associated_records.push(mem_access.clone());
     } else {
-        if copy.current_from < copy.from + copy.size {
-            copy.current_from += access_size_bytes;
-            copy.associated_indices.push(global_idx);
-            copy.associated_records.push(mem_access.clone());
-        }
+        copy.current_from += access_size_bytes;
     }
     if copy.cpu != current_cpu {
         copy.first_insn_count = mem_access.insn_count;
     }
     copy.insn_count = mem_access.insn_count;
     copy.cpu = current_cpu;
+    copy.associated_indices.push(global_idx);
+    copy.associated_records.push(mem_access.clone());
     copy_done(&copy)
 }
 
@@ -225,10 +220,11 @@ fn check_potential_copy_start(
     global_idx: usize,
 ) -> bool {
     let mut potential_copy = false;
+
     for copy in copy_window {
         if mem_access.cpu != copy.cpu {
-            continue;
-        }
+                continue;
+            }
         let is_start = match copy.operation {
             'r' => {
                 mem_access.store == 0 && copy.kernel_address == mem_access.address
@@ -246,19 +242,9 @@ fn check_potential_copy_start(
             for pot_copy in potential_copies.iter_mut() {
                 if pot_copy.rec_id == copy.rec_id {
                     if pot_copy.current_to == pot_copy.to {
-                        // Si aucun STORE n'a été fait, la copie recommence : on vide les anciens LOADs
-                        pot_copy.associated_indices.clear();
-                        pot_copy.associated_records.clear();
-
                         pot_copy.insn_count = mem_access.insn_count;
-                        pot_copy.first_insn_count = mem_access.insn_count;
-                        pot_copy.first_global_idx = global_idx;
-
                         pot_copy.associated_indices.push(global_idx);
                         pot_copy.associated_records.push(mem_access.clone());
-
-                        let access_size_bytes = 1 << mem_access.size;
-                        pot_copy.current_from = mem_access.address + access_size_bytes;
                         potential_copy = true;
                     }
                     existing_potential_copy = true;
