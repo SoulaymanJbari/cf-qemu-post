@@ -4,7 +4,6 @@ use cf_qemu_post::memory_access::{MemRecord, MemoryAccess, RowcloneRecord};
 use clap::{Parser, command};
 use once_cell::sync::Lazy;
 use regex::Regex;
-use std::collections::HashMap;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
@@ -17,8 +16,7 @@ static NEXT_KERNEL_REC_ID: AtomicU64 = AtomicU64::new(0);
 
 struct KernelRecord {
     rec_id: u64,
-    command: String,
-    cpu: u32,
+    cpu: u8,
     size: u64,
     operation: char,
     kernel_address: u64,
@@ -34,8 +32,7 @@ impl fmt::Debug for KernelRecord {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "KernelRecord {{command: {}, cpu: {}, size: {}, op: {}, kernel_address: 0x{:016x}, user_address: 0x{:016x} }}",
-            self.command,
+            "KernelRecord {{cpu: {}, size: {}, op: {}, kernel_address: 0x{:016x}, user_address: 0x{:016x} }}",
             self.cpu,
             self.size,
             self.operation,
@@ -49,7 +46,6 @@ impl fmt::Debug for KernelRecord {
 struct MemCpy {
     rec_id: u64,
     cpu: usize,
-    insn_count: u64,
     from: u64,
     to: u64,
     size: u64,
@@ -86,7 +82,6 @@ fn parse_kernel_line(line: &str) -> Option<KernelRecord> {
         };
         Some(KernelRecord {
             rec_id: NEXT_KERNEL_REC_ID.fetch_add(1, Ordering::Relaxed),
-            command: caps[1].to_string(),
             cpu: caps[2].parse().ok()?,
             size: 4096,
             operation,
@@ -100,6 +95,9 @@ fn parse_kernel_line(line: &str) -> Option<KernelRecord> {
 }
 
 fn mem_copy_match(mem_access: &log_parser::LogRecord, copy: &MemCpy) -> bool {
+    if mem_access.cpu as usize != copy.cpu {
+        return false;
+    }
     (copy.current_from == mem_access.address && mem_access.store == 0)
         || (copy.current_to == mem_access.address && mem_access.store == 1)
 }
@@ -115,20 +113,14 @@ fn update_copy(
     global_idx: usize,
 ) -> bool {
     let access_size_bytes = 1 << mem_access.size;
-    let current_cpu = mem_access.cpu as usize;
     let copy = &mut copies[copy_idx];
     if mem_access.store == 1 {
         copy.current_to += access_size_bytes;
     } else {
         copy.current_from += access_size_bytes;
     }
-    if copy.cpu != current_cpu {
-        copy.first_insn_count = mem_access.insn_count;
-    }
-    copy.insn_count = mem_access.insn_count;
-    copy.cpu = current_cpu;
     copy.associated_indices.push(global_idx);
-    copy_done(&copy)
+    copy_done(copy)
 }
 
 fn next_kernel_line(
@@ -142,15 +134,6 @@ fn next_kernel_line(
         }
     }
     None
-}
-
-fn push_ongoing_copy(
-    ongoing_copies: &mut Vec<MemCpy>,
-    potential_copies: &mut Vec<MemCpy>,
-    idx: usize,
-) {
-    let copy = potential_copies.remove(idx);
-    ongoing_copies.push(copy);
 }
 
 fn print_rowclone<W: Write>(copy: &RowcloneEvent, output: &mut BufWriter<W>) {
@@ -252,6 +235,9 @@ fn check_potential_copy_start(
     let mut potential_copy = false;
 
     for copy in copy_window {
+        if mem_access.cpu != copy.cpu {
+            continue;
+        }
         let is_start = match copy.operation {
             'r' => {
                 mem_access.store == 0 && copy.kernel_address == mem_access.address
@@ -269,7 +255,6 @@ fn check_potential_copy_start(
             for pot_copy in potential_copies.iter_mut() {
                 if pot_copy.rec_id == copy.rec_id {
                     if pot_copy.current_to == pot_copy.to {
-                        pot_copy.insn_count = mem_access.insn_count;
                         pot_copy.associated_indices.push(global_idx);
                         potential_copy = true;
                     }
@@ -288,10 +273,9 @@ fn check_potential_copy_start(
                 indices.push(global_idx);
                 potential_copies.push(MemCpy {
                     rec_id: copy.rec_id,
-                    insn_count: mem_access.insn_count,
                     from: mem_access.address,
                     to,
-                    cpu: mem_access.cpu as usize,
+                    cpu: copy.cpu as usize,
                     size: copy.size,
                     current_from: mem_access.address + (1 << mem_access.size),
                     current_to: to,
@@ -300,6 +284,7 @@ fn check_potential_copy_start(
                     first_global_idx: global_idx,
                 });
                 potential_copy = true;
+                break;
             }
         }
     }
