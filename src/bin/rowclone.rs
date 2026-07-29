@@ -103,7 +103,7 @@ fn mem_copy_match(mem_access: &log_parser::LogRecord, copy: &MemCpy) -> bool {
 }
 
 fn copy_done(copy: &MemCpy) -> bool {
-    copy.current_to >= copy.to + copy.size
+    copy.current_from >= copy.from + copy.size && copy.current_to >= copy.to + copy.size
 }
 
 fn update_copy(
@@ -116,10 +116,13 @@ fn update_copy(
     let copy = &mut copies[copy_idx];
     if mem_access.store == 1 {
         copy.current_to += access_size_bytes;
+        copy.associated_indices.push(global_idx);
     } else {
-        copy.current_from += access_size_bytes;
+        if copy.current_from < copy.from + copy.size {
+            copy.current_from += access_size_bytes;
+            copy.associated_indices.push(global_idx);
+        }
     }
-    copy.associated_indices.push(global_idx);
     copy_done(copy)
 }
 
@@ -172,6 +175,7 @@ fn update_stale(rec_id: u64, copy_window: &mut Vec<KernelRecord>) {
         }
     }
 }
+
 fn remove_stale_copies(
     rec_id: u64,
     copy_window: &mut Vec<KernelRecord>,
@@ -255,7 +259,15 @@ fn check_potential_copy_start(
             for pot_copy in potential_copies.iter_mut() {
                 if pot_copy.rec_id == copy.rec_id {
                     if pot_copy.current_to == pot_copy.to {
+                        // Réinitialiser la liste si la copie redémarre avant le premier STORE
+                        pot_copy.associated_indices.clear();
+                        pot_copy.first_insn_count = mem_access.insn_count;
+                        pot_copy.first_global_idx = global_idx;
+
                         pot_copy.associated_indices.push(global_idx);
+
+                        let access_size_bytes = 1 << mem_access.size;
+                        pot_copy.current_from = mem_access.address + access_size_bytes;
                         potential_copy = true;
                     }
                     existing_potential_copy = true;
@@ -284,7 +296,6 @@ fn check_potential_copy_start(
                     first_global_idx: global_idx,
                 });
                 potential_copy = true;
-                break;
             }
         }
     }
@@ -334,6 +345,9 @@ fn match_copy_to_mem_accesses<W1: Write, W2: Write>(
 
     eprintln!("Génération finale du fichier...");
     let mut final_rowclones = 0;
+    let mut total_removed_loads = 0;
+    let mut total_removed_stores = 0;
+
     for (idx, mem_access) in baseline_history.iter().enumerate() {
 
         if idx < start_bound || idx > end_bound {
@@ -342,6 +356,11 @@ fn match_copy_to_mem_accesses<W1: Write, W2: Write>(
 
         print_regular_access(mem_access, baseline_output);
         if valid_indices[idx] {
+            if mem_access.store == 1 {
+                total_removed_stores += 1;
+            } else {
+                total_removed_loads += 1;
+            }
             if let Some(event) = rowclone_events.iter().find(|e| e.target_global_idx == idx) {
                 print_rowclone(event, rowclone_output);
                 final_rowclones += 1;
@@ -351,7 +370,15 @@ fn match_copy_to_mem_accesses<W1: Write, W2: Write>(
         print_regular_access(mem_access, rowclone_output);
     }
 
-    eprintln!("Rowclones validated: {}", final_rowclones);
+    let total_removed_accesses = total_removed_loads + total_removed_stores;
+    let expected_accesses = final_rowclones * 768;
+
+    eprintln!("================ STATS DE FILTRAGE DETECTEES ================");
+    eprintln!("Rowclones valides                        : {}", final_rowclones);
+    eprintln!("LOADs supprimes de la trace              : {} (attendu : {})", total_removed_loads, final_rowclones * 512);
+    eprintln!("STOREs supprimes de la trace             : {} (attendu : {})", total_removed_stores, final_rowclones * 256);
+    eprintln!("Total accès supprimes (LOAD+STORE)       : {} (attendu : {})", total_removed_accesses, expected_accesses);
+    eprintln!("=============================================================");
     eprintln!("Rowclones uncompleted: {}", active_copies.len());
 }
 
@@ -394,6 +421,7 @@ pub fn add_rowclone_info(
     let _ = bl_writer.flush();
     Ok(())
 }
+
 #[derive(Parser, Debug)]
 #[command(about)]
 struct Args {
