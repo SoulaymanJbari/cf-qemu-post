@@ -196,6 +196,8 @@ fn check_potential_copy_start(
             }
             if !existing {
                 let access_size_bytes = 1 << mem_access.size;
+                let mut indices = Vec::with_capacity(768);
+                indices.push(global_idx);
                 potential_copies.push(MemCpy {
                     rec_id: copy.rec_id,
                     from: mem_access.address,
@@ -203,7 +205,7 @@ fn check_potential_copy_start(
                     size: copy.size,
                     current_from : mem_access.address + access_size_bytes,
                     current_to: copy.dst_address,
-                    associated_indices: vec![global_idx],
+                    associated_indices: indices,
                     first_insn_count: mem_access.insn_count,
                     first_global_idx: global_idx,
                 });
@@ -328,6 +330,11 @@ fn process_single_cpu_trace(
     let mut bl_fmt = RamulatorFormatter::new(BufWriter::new(File::create(baseline_out_path)?));
     let mut rc_fmt = RamulatorFormatter::new(BufWriter::new(File::create(rowclone_out_path)?));
 
+    let events_map: HashMap<usize, &RowcloneEvent> = rowclone_events
+        .iter()
+        .map(|e| (e.target_global_idx, e))
+        .collect();
+
     let mut final_rowclones = 0;
     let mut total_removed_loads = 0;
     let mut total_removed_stores = 0;
@@ -346,7 +353,7 @@ fn process_single_cpu_trace(
                 total_removed_loads += 1;
             }
 
-            if let Some(event) = rowclone_events.iter().find(|e| e.target_global_idx == idx) {
+            if let Some(event) = events_map.get(&idx) {
                 rc_fmt.write_rowclone(event)?;
                 final_rowclones += 1;
             }
