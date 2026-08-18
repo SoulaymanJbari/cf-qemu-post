@@ -7,28 +7,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use cf_qemu_post::log_parser::{LogParser, LogRecord};
 use clap::Parser;
-use once_cell::sync::Lazy;
 use rayon::prelude::*;
-use regex::Regex;
 
 const COPY_WINDOW: usize = 200;
 const COPY_WINDOW_STALE_TRESHOLD: usize = 20;
 
 static NEXT_KERNEL_REC_ID: AtomicU64 = AtomicU64::new(0);
 
-static KERNEL_LOG_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"([^\s]+)\s+\[(\d+)\].*rowclone_(read|write):\s+\[RC\]\s+(0x[0-9a-fA-F]+)\s+(0x[0-9a-fA-F]+)"#)
-        .expect("failed to compile regex")
-});
-
 #[derive(Clone)]
 struct KernelRecord {
     rec_id: u64,
     cpu: u8,
     size: u64,
-    operation: char,
-    kernel_address: u64,
-    user_address: u64,
+    src_address: u64,
+    dst_address: u64,
     stale: usize,
 }
 
@@ -36,8 +28,8 @@ impl fmt::Debug for KernelRecord {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "KernelRecord {{cpu: {}, size: {}, op: {}, kernel_address: 0x{:016x}, user_address: 0x{:016x} }}",
-            self.cpu, self.size, self.operation, self.kernel_address, self.user_address
+            "KernelRecord {{ cpu: {}, size: {}, src: 0x{:016x}, dst: 0x{:016x} }}",
+            self.cpu, self.size, self.src_address, self.dst_address
         )
     }
 }
@@ -67,28 +59,24 @@ fn parse_hex_address(hex_str: &str) -> Option<u64> {
 }
 
 fn parse_kernel_line(line: &str) ->Option<KernelRecord> {
-    if let Some(caps) = KERNEL_LOG_PATTERN.captures(line) {
-        let op_str = &caps[3];
-        let operation = if op_str == "read" { 'r' } else { 'w' };
-        let src_addr = parse_hex_address(&caps[4])?;
-        let dst_addr = parse_hex_address(&caps[5])?;
-        let (kernel_address, user_address) = if operation == 'r' {
-            (src_addr, dst_addr)
-        } else {
-            (dst_addr, src_addr)
-        };
-        Some(KernelRecord {
-            rec_id: NEXT_KERNEL_REC_ID.fetch_add(1, Ordering::Relaxed),
-            cpu: caps[2].parse().ok()?,
-            size: 4096,
-            operation,
-            kernel_address,
-            user_address,
-            stale: 0,
-        })
-    } else {
-        None
+    let line = line.trim();
+    if line.starts_with("#") || line.is_empty() {
+        return None;
     }
+
+    let mut parts = line.split_whitespace();
+    let cpu: u8 = parts.next()?.parse().ok()?;
+    let src_address = parse_hex_address(parts.next()?)?;
+    let dst_address = parse_hex_address(parts.next()?)?;
+
+    Some(KernelRecord {
+        rec_id : NEXT_KERNEL_REC_ID.fetch_add(1, Ordering::Relaxed),
+        cpu,
+        size: 4096,
+        src_address,
+        dst_address,
+        stale: 0,
+    })
 }
 
 fn mem_copy_match(mem_access: &LogRecord, copy: &MemCpy) -> bool {
@@ -186,11 +174,7 @@ fn check_potential_copy_start(
 ) -> bool {
     let mut potential_copy = false;
     for copy in copy_window {
-        let is_start = match copy.operation {
-            'r' => mem_access.store == 0 && copy.kernel_address == mem_access.address,
-            'w' => mem_access.store == 0 && copy.user_address == mem_access.address,
-            _ => false,
-        };
+        let is_start = mem_access.store == 0 && copy.src_address == mem_access.address;
 
         if is_start {
             let mut existing = false;
@@ -211,19 +195,14 @@ fn check_potential_copy_start(
                 }
             }
             if !existing {
-                let to = if copy.operation == 'w' {
-                    copy.kernel_address
-                } else {
-                    copy.user_address
-                };
                 let access_size_bytes = 1 << mem_access.size;
                 potential_copies.push(MemCpy {
                     rec_id: copy.rec_id,
                     from: mem_access.address,
-                    to,
+                    to: copy.dst_address,
                     size: copy.size,
                     current_from : mem_access.address + access_size_bytes,
-                    current_to: to,
+                    current_to: copy.dst_address,
                     associated_indices: vec![global_idx],
                     first_insn_count: mem_access.insn_count,
                     first_global_idx: global_idx,

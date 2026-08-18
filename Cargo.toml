@@ -5,7 +5,5 @@ edition = "2024"
 
 [dependencies]
 clap = { version = "4.5.38", features = ["derive"] }
-once_cell = "1.21.3"
-regex = "1.11.1"
 rayon = "1.10"
 
