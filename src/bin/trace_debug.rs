@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -28,8 +28,8 @@ impl fmt::Debug for KernelRecord {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "KernelRecord {{ cpu: {}, size: {}, src: 0x{:016x}, dst: 0x{:016x} }}",
-            self.cpu, self.size, self.src_address, self.dst_address
+            "KernelRecord {{ rec_id: {}, cpu: {}, size: {}, src: 0x{:016x}, dst: 0x{:016x} }}",
+            self.rec_id, self.cpu, self.size, self.src_address, self.dst_address
         )
     }
 }
@@ -126,9 +126,17 @@ fn remove_stale_copies(
     rec_id: u64,
     copy_window: &mut Vec<KernelRecord>,
     copy_logs: &mut impl Iterator<Item = KernelRecord>,
+    evicted_stale: &mut Vec<KernelRecord>,
 ) {
     update_stale(rec_id, copy_window);
-    copy_window.retain(|copy| copy.stale <= COPY_WINDOW_STALE_THRESHOLD);
+    copy_window.retain(|copy| {
+        if copy.stale > COPY_WINDOW_STALE_THRESHOLD {
+            evicted_stale.push(copy.clone());
+            false
+        } else {
+            true
+        }
+    });
 
     while copy_window.len() < COPY_WINDOW {
         if let Some(record) = copy_logs.next() {
@@ -146,6 +154,7 @@ fn track_active_copies(
     rowclone_events: &mut Vec<RowcloneEvent>,
     copy_window: &mut Vec<KernelRecord>,
     copy_logs: &mut impl Iterator<Item = KernelRecord>,
+    evicted_stale: &mut Vec<KernelRecord>,
 ) -> bool {
     for idx in 0..active_copies.len() {
         if mem_copy_match(mem_access, &active_copies[idx]) {
@@ -154,7 +163,7 @@ fn track_active_copies(
                 let rec_id = active_copies[idx].rec_id;
                 let removed_count = active_copies[idx].associated_indices.len();
                 copy_window.retain(|i| i.rec_id != rec_id);
-                remove_stale_copies(rec_id, copy_window, copy_logs);
+                remove_stale_copies(rec_id, copy_window, copy_logs, evicted_stale);
 
                 let internal_records = std::mem::take(&mut active_copies[idx].associated_records);
 
@@ -250,13 +259,21 @@ fn process_single_cpu_trace_debug(
         return Ok(());
     }
     let cpu_id = baseline_history[0].cpu;
-    eprintln!("[CPU {}] Trace chargée ({} accès).", cpu_id, baseline_history.len());
+    let total_kernel_initial = kernel_records.len();
+    eprintln!(
+        "[CPU {}] Trace chargée ({} accès mémoire, {} entrées kernel associées).",
+        cpu_id,
+        baseline_history.len(),
+        total_kernel_initial
+    );
 
+    let initial_records = kernel_records.clone();
     let mut kernel_iter = kernel_records.into_iter();
     let mut copy_window: Vec<KernelRecord> = kernel_iter.by_ref().take(COPY_WINDOW).collect();
 
     let mut active_copies: Vec<MemCpy> = Vec::new();
     let mut rowclone_events: Vec<RowcloneEvent> = Vec::new();
+    let mut evicted_stale: Vec<KernelRecord> = Vec::new();
 
     for (current_idx, mem_access) in baseline_history.iter().enumerate() {
         if track_active_copies(
@@ -266,12 +283,14 @@ fn process_single_cpu_trace_debug(
             &mut rowclone_events,
             &mut copy_window,
             &mut kernel_iter,
+            &mut evicted_stale,
         ) {
             continue;
         }
         check_potential_copy_start(mem_access, &copy_window, &mut active_copies, current_idx);
     }
 
+    // 1. Écriture du journal des copies DÉTECTÉES
     let debug_out_path = debug_dir.join(format!("debug_cpu_{}.log", cpu_id));
     let mut writer = BufWriter::new(File::create(debug_out_path)?);
 
@@ -317,12 +336,121 @@ fn process_single_cpu_trace_debug(
     }
     writer.flush()?;
 
+    // 2. Écriture du journal des copies MANQUÉES / NON EFFECTUÉES
+    let completed_ids: HashSet<u64> = rowclone_events.iter().map(|e| e.rec_id).collect();
+    let missed_out_path = debug_dir.join(format!("missed_cpu_{}.log", cpu_id));
+    let mut missed_writer = BufWriter::new(File::create(missed_out_path)?);
+
+    let mut count_incomplete = 0;
+    let mut count_stale = 0;
+    let mut count_never_started = 0;
+    let mut count_never_entered = 0;
+
+    for rec in &initial_records {
+        if completed_ids.contains(&rec.rec_id) {
+            continue;
+        }
+
+        writeln!(missed_writer, "=============================================================")?;
+        if let Some(active) = active_copies.iter().find(|c| c.rec_id == rec.rec_id) {
+            count_incomplete += 1;
+            let bytes_from = active.current_from.saturating_sub(active.from);
+            let bytes_to = active.current_to.saturating_sub(active.to);
+            writeln!(
+                missed_writer,
+                "STATUT: INCOMPLÈTE EN FIN DE TRACE | ID: {} | CPU: {}",
+                rec.rec_id, rec.cpu
+            )?;
+            writeln!(
+                missed_writer,
+                "Source: 0x{:016x} -> Destination: 0x{:016x}",
+                rec.src_address, rec.dst_address
+            )?;
+            writeln!(missed_writer, "Progression au moment de l'arrêt :")?;
+            writeln!(
+                missed_writer,
+                "  - Source lue        : {} / {} octets ({:.1}%)",
+                bytes_from,
+                rec.size,
+                (bytes_from as f64 / rec.size as f64) * 100.0
+            )?;
+            writeln!(
+                missed_writer,
+                "  - Destination écrite: {} / {} octets ({:.1}%)",
+                bytes_to,
+                rec.size,
+                (bytes_to as f64 / rec.size as f64) * 100.0
+            )?;
+            writeln!(
+                missed_writer,
+                "  - Accès interceptés : {}",
+                active.associated_indices.len()
+            )?;
+        } else if evicted_stale.iter().any(|e| e.rec_id == rec.rec_id) {
+            count_stale += 1;
+            writeln!(
+                missed_writer,
+                "STATUT: ÉVINCÉE DE LA FENÊTRE (STALE > {}) | ID: {} | CPU: {}",
+                COPY_WINDOW_STALE_THRESHOLD, rec.rec_id, rec.cpu
+            )?;
+            writeln!(
+                missed_writer,
+                "Source: 0x{:016x} -> Destination: 0x{:016x}",
+                rec.src_address, rec.dst_address
+            )?;
+            writeln!(
+                missed_writer,
+                "Détail : La fenêtre glissante a purgé cette copie car 20 copies ultérieures se sont terminées avant elle."
+            )?;
+        } else if copy_window.iter().any(|w| w.rec_id == rec.rec_id) {
+            count_never_started += 1;
+            writeln!(
+                missed_writer,
+                "STATUT: JAMAIS DÉMARRÉE (DANS LA FENÊTRE) | ID: {} | CPU: {}",
+                rec.rec_id, rec.cpu
+            )?;
+            writeln!(
+                missed_writer,
+                "Source: 0x{:016x} -> Destination: 0x{:016x}",
+                rec.src_address, rec.dst_address
+            )?;
+            writeln!(
+                missed_writer,
+                "Détail : Aucun accès LOAD initial à l'adresse 0x{:016x} n'a été intercepté.",
+                rec.src_address
+            )?;
+        } else {
+            count_never_entered += 1;
+            writeln!(
+                missed_writer,
+                "STATUT: JAMAIS ENTRÉE DANS LA FENÊTRE | ID: {} | CPU: {}",
+                rec.rec_id, rec.cpu
+            )?;
+            writeln!(
+                missed_writer,
+                "Source: 0x{:016x} -> Destination: 0x{:016x}",
+                rec.src_address, rec.dst_address
+            )?;
+            writeln!(
+                missed_writer,
+                "Détail : La fenêtre est restée bloquée avant que cette entrée n'y entre.",
+            )?;
+        }
+    }
+    missed_writer.flush()?;
+
+    let total_missed = count_incomplete + count_stale + count_never_started + count_never_entered;
     eprintln!(
-        "[CPU {}] Analyse terminée -> {} RowClones validés ({} LOADs, {} STOREs)",
+        "[CPU {}] Rapport : {} Total Kernel | {} Validées | {} Manquées\n  \
+         -> Incomplètes: {} | Évincées (stale): {} | Jamais démarrées: {} | Hors-fenêtre: {}",
         cpu_id,
+        total_kernel_initial,
         rowclone_events.len(),
-        total_loads,
-        total_stores
+        total_missed,
+        count_incomplete,
+        count_stale,
+        count_never_started,
+        count_never_entered
     );
 
     Ok(())
