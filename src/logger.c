@@ -18,6 +18,9 @@ typedef struct LogRecord {
     char padding[5];
 } LogRecord;
 
+#define RC_BATCH_SIZE       (128 * sizeof(LogRecord))
+#define LOG_BUFFER_SIZE_PER_CPU (341 * RC_BATCH_SIZE)
+
 void transfer_logs(const char *output_dir, size_t buf_size_per_cpu) {
     const char *meta_file = "/dev/shm/qemu_trace_metadata";
     const char *shm_file  = "/dev/shm/ramulator_qemu_shm";
@@ -89,7 +92,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Erreur : taille de buffer invalide (%s)\n", argv[2]);
         exit(EXIT_FAILURE);
     }
-    size_t buf_size_per_cpu = (size_t)mb * (1024 * 1024);
+    size_t buf_size_per_cpu = (size_t)mb * LOG_BUFFER_SIZE_PER_CPU;
 
     struct stat st = {0};
     if (stat(output_dir, &st) == -1) {
