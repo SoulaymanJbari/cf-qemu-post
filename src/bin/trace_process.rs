@@ -144,6 +144,7 @@ fn track_active_copies(
         if mem_copy_match(mem_access, &active_copies[idx]) {
             let done = update_copy(active_copies, idx, mem_access, global_idx);
             if done {
+                let completed_first_idx = active_copies[idx].first_global_idx;
                 let rec_id = active_copies[idx].rec_id;
                 copy_window.retain(|i| i.rec_id != rec_id);
                 remove_stale_copies(rec_id, copy_window, copy_logs);
@@ -158,7 +159,7 @@ fn track_active_copies(
                     from: active_copies[idx].from,
                     to: active_copies[idx].to,
                 });
-                active_copies.remove(idx);
+                active_copies.retain(|c| c.first_global_idx != completed_first_idx);
             }
             return true;
         }
