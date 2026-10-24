@@ -51,6 +51,7 @@ struct RowcloneEvent {
     target_global_idx: usize,
     end_global_idx: usize,
     insn_count: u64,
+    end_insn_count: u64,
     from: u64,
     to: u64,
 }
@@ -156,6 +157,7 @@ fn track_active_copies(
                     target_global_idx: active_copies[idx].first_global_idx,
                     end_global_idx: global_idx,
                     insn_count: active_copies[idx].first_insn_count,
+                    end_insn_count: mem_access.insn_count,
                     from: active_copies[idx].from,
                     to: active_copies[idx].to,
                 });
@@ -267,7 +269,7 @@ impl<W: Write> RamulatorFormatter<W> {
             event.insn_count - self.prev_insn_count
         };
         writeln!(self.writer, "{} 0x{:016x} 0x{:016x}", bubble, event.from, event.to)?;
-        self.prev_insn_count = event.insn_count;
+        self.prev_insn_count = event.end_insn_count;;
         Ok(())
     }
 
