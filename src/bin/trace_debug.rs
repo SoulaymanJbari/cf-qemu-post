@@ -11,6 +11,7 @@ use rayon::prelude::*;
 
 const COPY_WINDOW: usize = 200;
 const COPY_WINDOW_STALE_THRESHOLD: usize = 20;
+const PAGE_MASK: u64 = !0xfff;
 
 static NEXT_KERNEL_REC_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -59,6 +60,19 @@ struct RowcloneEvent {
     records: Vec<LogRecord>,
 }
 
+#[derive(Default)]
+struct Presence {
+    src_loads: u64,
+    src_stores: u64,
+    src_load_at_start: u64,
+    src_lines: u64,
+    src_first_idx: Option<usize>,
+    dst_stores: u64,
+    dst_loads: u64,
+    dst_lines: u64,
+    dst_first_idx: Option<usize>,
+}
+
 fn parse_hex_address(hex_str: &str) -> Option<u64> {
     u64::from_str_radix(hex_str.trim_start_matches("0x"), 16).ok()
 }
@@ -91,6 +105,77 @@ fn mem_copy_match(mem_access: &LogRecord, copy: &MemCpy) -> bool {
 
 fn copy_done(copy: &MemCpy) -> bool {
     copy.current_from >= copy.from + copy.size && copy.current_to >= copy.to + copy.size
+}
+
+fn scan_presence(history: &[LogRecord], records: &[KernelRecord]) -> HashMap<u64, Presence> {
+    let mut by_src: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
+    let mut by_dst: HashMap<u64, Vec<u64>> = HashMap::new();
+    for r in records {
+        by_src.entry(r.src_address & PAGE_MASK).or_default().push((r.rec_id, r.src_address));
+        by_dst.entry(r.dst_address & PAGE_MASK).or_default().push(r.rec_id);
+    }
+
+    let mut out: HashMap<u64, Presence> =
+        records.iter().map(|r| (r.rec_id, Presence::default())).collect();
+
+    for (idx, a) in history.iter().enumerate() {
+        let page = a.address & PAGE_MASK;
+        let line_bit = 1u64 << ((a.address & 0xfff) >> 6);
+
+        if let Some(ids) = by_src.get(&page) {
+            for &(id, src_addr) in ids {
+                let p = out.get_mut(&id).unwrap();
+                if a.store == 1 {
+                    p.src_stores += 1;
+                } else {
+                    p.src_loads += 1;
+                    p.src_lines |= line_bit;
+                    p.src_first_idx.get_or_insert(idx);
+                    if a.address == src_addr {
+                        p.src_load_at_start += 1;
+                    }
+                }
+            }
+        }
+        if let Some(ids) = by_dst.get(&page) {
+            for &id in ids {
+                let p = out.get_mut(&id).unwrap();
+                if a.store == 1 {
+                    p.dst_stores += 1;
+                    p.dst_lines |= line_bit;
+                    p.dst_first_idx.get_or_insert(idx);
+                } else {
+                    p.dst_loads += 1;
+                }
+            }
+        }
+    }
+    out
+}
+
+fn presence_status(p: &Presence) -> &'static str {
+    match (p.src_loads > 0, p.dst_stores > 0) {
+        (false, false) => "SRC et DST absentes",
+        (false, true) => "SRC absente",
+        (true, false) => "DST absente",
+        _ if p.src_load_at_start == 0 => "SRC présente mais aucun LOAD à l'adresse exacte",
+        _ if p.src_lines.count_ones() < 64 || p.dst_lines.count_ones() < 64 => "Couverture partielle",
+        _ => "SRC et DST complètes (problème de séquence)",
+    }
+}
+
+fn write_presence(w: &mut impl Write, p: &Presence) -> std::io::Result<()> {
+    writeln!(w, "Présence dans la trace : {}", presence_status(p))?;
+    writeln!(
+        w,
+        "  - SRC : {} LOAD ({} à l'adresse exacte, {}/64 lignes), {} STORE, 1er idx {:?}",
+        p.src_loads, p.src_load_at_start, p.src_lines.count_ones(), p.src_stores, p.src_first_idx
+    )?;
+    writeln!(
+        w,
+        "  - DST : {} STORE ({}/64 lignes), {} LOAD, 1er idx {:?}",
+        p.dst_stores, p.dst_lines.count_ones(), p.dst_loads, p.dst_first_idx
+    )
 }
 
 fn update_copy(
@@ -268,6 +353,7 @@ fn process_single_cpu_trace_debug(
     );
 
     let initial_records = kernel_records.clone();
+    let presence = scan_presence(&baseline_history, &initial_records);
     let mut kernel_iter = kernel_records.into_iter();
     let mut copy_window: Vec<KernelRecord> = kernel_iter.by_ref().take(COPY_WINDOW).collect();
 
@@ -345,6 +431,7 @@ fn process_single_cpu_trace_debug(
     let mut count_stale = 0;
     let mut count_never_started = 0;
     let mut count_never_entered = 0;
+    let mut presence_counts: HashMap<&'static str, usize> = HashMap::new();
 
     for rec in &initial_records {
         if completed_ids.contains(&rec.rec_id) {
@@ -436,6 +523,9 @@ fn process_single_cpu_trace_debug(
                 "Détail : La fenêtre est restée bloquée avant que cette entrée n'y entre.",
             )?;
         }
+        let p = &presence[&rec.rec_id];
+        write_presence(&mut missed_writer, p)?;
+        *presence_counts.entry(presence_status(p)).or_default() += 1;
     }
     missed_writer.flush()?;
 
@@ -452,6 +542,7 @@ fn process_single_cpu_trace_debug(
         count_never_started,
         count_never_entered
     );
+    eprintln!("[CPU {}] Présence des copies manquées : {:?}", cpu_id, presence_counts);
 
     Ok(())
 }

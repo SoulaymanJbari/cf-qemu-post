@@ -269,7 +269,7 @@ impl<W: Write> RamulatorFormatter<W> {
             event.insn_count - self.prev_insn_count
         };
         writeln!(self.writer, "{} 0x{:016x} 0x{:016x}", bubble, event.from, event.to)?;
-        self.prev_insn_count = event.end_insn_count;;
+        self.prev_insn_count = event.end_insn_count;
         Ok(())
     }
 
