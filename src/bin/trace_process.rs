@@ -37,7 +37,7 @@ impl fmt::Debug for KernelRecord {
 #[derive(Clone)]
 struct MemCpy {
     rec_id: u64,
-    from : u64,
+    from: u64,
     to: u64,
     size: u64,
     current_from: u64,
@@ -47,6 +47,7 @@ struct MemCpy {
     first_global_idx: usize,
 }
 
+#[derive(Clone)]
 struct RowcloneEvent {
     target_global_idx: usize,
     end_global_idx: usize,
@@ -55,13 +56,14 @@ struct RowcloneEvent {
     from: u64,
     to: u64,
 }
+
 fn parse_hex_address(hex_str: &str) -> Option<u64> {
     u64::from_str_radix(hex_str.trim_start_matches("0x"), 16).ok()
 }
 
-fn parse_kernel_line(line: &str) ->Option<KernelRecord> {
+fn parse_kernel_line(line: &str) -> Option<KernelRecord> {
     let line = line.trim();
-    if line.starts_with("#") || line.is_empty() {
+    if line.starts_with('#') || line.is_empty() {
         return None;
     }
 
@@ -71,7 +73,7 @@ fn parse_kernel_line(line: &str) ->Option<KernelRecord> {
     let dst_address = parse_hex_address(parts.next()?)?;
 
     Some(KernelRecord {
-        rec_id : NEXT_KERNEL_REC_ID.fetch_add(1, Ordering::Relaxed),
+        rec_id: NEXT_KERNEL_REC_ID.fetch_add(1, Ordering::Relaxed),
         cpu,
         size: 4096,
         src_address,
@@ -81,8 +83,8 @@ fn parse_kernel_line(line: &str) ->Option<KernelRecord> {
 }
 
 fn mem_copy_match(mem_access: &LogRecord, copy: &MemCpy) -> bool {
-    (copy.current_from == mem_access.address && mem_access.store == 0) ||
-    (copy.current_to == mem_access.address && mem_access.store == 1) 
+    (copy.current_from == mem_access.address && mem_access.store == 0)
+        || (copy.current_to == mem_access.address && mem_access.store == 1)
 }
 
 fn copy_done(copy: &MemCpy) -> bool {
@@ -110,7 +112,7 @@ fn update_copy(
 fn update_stale(rec_id: u64, copy_window: &mut Vec<KernelRecord>) {
     for copy in copy_window {
         if copy.rec_id < rec_id {
-            copy.stale +=1;
+            copy.stale += 1;
         }
     }
 }
@@ -206,7 +208,7 @@ fn check_potential_copy_start(
                     from: mem_access.address,
                     to: copy.dst_address,
                     size: copy.size,
-                    current_from : mem_access.address + access_size_bytes,
+                    current_from: mem_access.address + access_size_bytes,
                     current_to: copy.dst_address,
                     associated_indices: indices,
                     first_insn_count: mem_access.insn_count,
@@ -219,7 +221,7 @@ fn check_potential_copy_start(
     potential_copy
 }
 
-// Ramulator Formating
+// Formatage Ramulator
 struct RamulatorFormatter<W: Write> {
     writer: BufWriter<W>,
     prev_insn_count: u64,
@@ -268,7 +270,11 @@ impl<W: Write> RamulatorFormatter<W> {
         } else {
             event.insn_count - self.prev_insn_count
         };
-        writeln!(self.writer, "{} 0x{:016x} 0x{:016x}", bubble, event.from, event.to)?;
+        writeln!(
+            self.writer,
+            "{} 0x{:016x} 0x{:016x}",
+            bubble, event.from, event.to
+        )?;
         self.prev_insn_count = event.end_insn_count;
         Ok(())
     }
@@ -278,14 +284,15 @@ impl<W: Write> RamulatorFormatter<W> {
     }
 }
 
-//CPU function
-
 fn process_single_cpu_trace(
     trace_path: &Path,
     kernel_records: Vec<KernelRecord>,
     post_log_dir: &Path,
     post_log_rc_dir: &Path,
-    crop_bounds: bool,
+    cluster_gap: Option<usize>,
+    min_cluster_copies: usize,
+    margin_before: usize,
+    margin_after: usize,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut parser = LogParser::new(trace_path.to_str().unwrap())?;
     let mut baseline_history: Vec<LogRecord> = Vec::new();
@@ -299,7 +306,8 @@ fn process_single_cpu_trace(
         return Ok(());
     }
     let cpu_id = baseline_history[0].cpu;
-    eprintln!("[CPU {}] Trace chargée ({} accès).", cpu_id, baseline_history.len());
+    let total_raw = baseline_history.len();
+    eprintln!("[CPU {}] Trace brute chargée ({} accès).", cpu_id, total_raw);
 
     let mut kernel_iter = kernel_records.into_iter();
     let mut copy_window: Vec<KernelRecord> = kernel_iter.by_ref().take(COPY_WINDOW).collect();
@@ -308,25 +316,92 @@ fn process_single_cpu_trace(
     let mut valid_indices = vec![false; baseline_history.len()];
     let mut rowclone_events: Vec<RowcloneEvent> = Vec::new();
 
-    //Pass 1 : Detection
+    // PASSE 1 : Détection 100% fidèle sur trace brute
     for (current_idx, mem_access) in baseline_history.iter().enumerate() {
-        if track_active_copies(mem_access, &mut active_copies, current_idx, &mut valid_indices,
-            &mut rowclone_events, &mut copy_window, &mut kernel_iter) {
-                continue;
+        if track_active_copies(
+            mem_access,
+            &mut active_copies,
+            current_idx,
+            &mut valid_indices,
+            &mut rowclone_events,
+            &mut copy_window,
+            &mut kernel_iter,
+        ) {
+            continue;
         }
         check_potential_copy_start(mem_access, &copy_window, &mut active_copies, current_idx);
     }
 
-    let (start_bound, end_bound) = if crop_bounds && !rowclone_events.is_empty() {
-        let first_idx = rowclone_events.iter().map(|e| e.target_global_idx).min().unwrap_or(0);
-        let last_idx = rowclone_events.iter().map(|e| e.end_global_idx).max().unwrap_or(baseline_history.len());
-        eprintln!("[CPU {}] Option CROP active : [{} à {}]", cpu_id, first_idx, last_idx);
-        (first_idx, last_idx)
+    let detected_rc_count = rowclone_events.len();
+    if detected_rc_count == 0 {
+        eprintln!("[CPU {}] 0 RowClone détecté sur ce cœur.", cpu_id);
     } else {
-        (0, baseline_history.len())
+        eprintln!("[CPU {}] Détection : {} RowClones identifiés.", cpu_id, detected_rc_count);
+    }
+
+    // CONSTRUCTION DU MASQUE ROI PAR CLUSTERING
+    let (in_roi, retained_rc_count) = if let Some(max_gap) = cluster_gap {
+        if detected_rc_count == 0 {
+            (vec![false; baseline_history.len()], 0)
+        } else {
+            let mut mask = vec![false; baseline_history.len()];
+            let mut valid_clusters: Vec<Vec<RowcloneEvent>> = Vec::new();
+            let mut current_cluster: Vec<RowcloneEvent> = vec![rowclone_events[0].clone()];
+
+            for w in rowclone_events.windows(2) {
+                let acc_gap = w[1].target_global_idx.saturating_sub(w[0].end_global_idx);
+                if acc_gap <= max_gap {
+                    current_cluster.push(w[1].clone());
+                } else {
+                    if current_cluster.len() >= min_cluster_copies {
+                        valid_clusters.push(current_cluster);
+                    }
+                    current_cluster = vec![w[1].clone()];
+                }
+            }
+            if current_cluster.len() >= min_cluster_copies {
+                valid_clusters.push(current_cluster);
+            }
+
+            let mut retained_copies = 0;
+            for cluster in &valid_clusters {
+                retained_copies += cluster.len();
+                let cluster_start = cluster.first().unwrap().target_global_idx;
+                let cluster_end = cluster.last().unwrap().end_global_idx;
+
+                // Application du rab personnalisé (avant et après)
+                let start = cluster_start.saturating_sub(margin_before);
+                let end = (cluster_end + margin_after).min(baseline_history.len() - 1);
+
+                for idx in start..=end {
+                    mask[idx] = true;
+                }
+            }
+
+            let kept_count = mask.iter().filter(|&&k| k).count();
+            eprintln!(
+                "[CPU {}] Filtrage actif : {} clusters (>= {} copies, gap <= {}) retenus | Copies: {}/{} ({:.1}%) | Rab: [-{}, +{}] | Accès conservés: {}/{} ({:.2}%)",
+                cpu_id,
+                valid_clusters.len(),
+                min_cluster_copies,
+                max_gap,
+                retained_copies,
+                detected_rc_count,
+                if detected_rc_count > 0 { (retained_copies as f64 * 100.0) / detected_rc_count as f64 } else { 0.0 },
+                margin_before,
+                margin_after,
+                kept_count,
+                total_raw,
+                (kept_count as f64 * 100.0) / (total_raw as f64)
+            );
+            (mask, retained_copies)
+        }
+    } else {
+        // Pas de filtrage spécifié : on conserve toute la trace brute
+        (vec![true; baseline_history.len()], detected_rc_count)
     };
 
-    //Pass 2 : Writing
+    // PASSE 2 : Écriture Ramulator avec compensation exacte des instructions hors-ROI
     let baseline_out_path = post_log_dir.join(format!("cpu_{}.trace", cpu_id));
     let rowclone_out_path = post_log_rc_dir.join(format!("cpu_{}.trace", cpu_id));
 
@@ -341,42 +416,60 @@ fn process_single_cpu_trace(
     let mut final_rowclones = 0;
     let mut total_removed_loads = 0;
     let mut total_removed_stores = 0;
+    let mut written_accesses = 0usize;
+
+    let mut cumulated_skipped_insns: u64 = 0;
+    let mut prev_raw_insn = baseline_history[0].insn_count;
 
     for (idx, mem_access) in baseline_history.iter().enumerate() {
-        if idx < start_bound || idx > end_bound {
+        let delta_insn = mem_access.insn_count.saturating_sub(prev_raw_insn);
+        prev_raw_insn = mem_access.insn_count;
+
+        // Si hors des clusters retenus : on purge l'accès et on compense son delta d'instructions
+        if !in_roi[idx] {
+            cumulated_skipped_insns += delta_insn;
             continue;
         }
 
-        bl_fmt.write_regular(mem_access)?;
+        // Accès conservé : insn_count réaligné pour effacer les temps morts hors cluster
+        let mut adj_access = mem_access.clone();
+        adj_access.insn_count = adj_access.insn_count.saturating_sub(cumulated_skipped_insns);
+
+        written_accesses += 1;
+        bl_fmt.write_regular(&adj_access)?;
 
         if valid_indices[idx] {
-            if mem_access.store == 1 {
+            if adj_access.store == 1 {
                 total_removed_stores += 1;
             } else {
                 total_removed_loads += 1;
             }
 
             if let Some(event) = events_map.get(&idx) {
-                rc_fmt.write_rowclone(event)?;
+                let mut adj_event = (*event).clone();
+                adj_event.insn_count = adj_event.insn_count.saturating_sub(cumulated_skipped_insns);
+                adj_event.end_insn_count = adj_event.end_insn_count.saturating_sub(cumulated_skipped_insns);
+
+                rc_fmt.write_rowclone(&adj_event)?;
                 final_rowclones += 1;
             }
             continue;
         }
 
-        rc_fmt.write_regular(mem_access)?;
+        rc_fmt.write_regular(&adj_access)?;
     }
+
     bl_fmt.flush()?;
     rc_fmt.flush()?;
     eprintln!(
-        "[CPU {}] Terminé -> RowClones: {}, Supprimés (LD: {}, ST: {})",
-        cpu_id, final_rowclones, total_removed_loads, total_removed_stores
+        "[CPU {}] Écriture terminée -> RowClones émis: {}/{} | Supprimés: LD={}, ST={} | Accès écrits: {}\n",
+        cpu_id, final_rowclones, retained_rc_count, total_removed_loads, total_removed_stores, written_accesses
     );
     Ok(())
 }
 
 #[derive(Parser, Debug)]
-#[command(about = "Traitement parallèle des traces CPU et détection RowClone")]
-
+#[command(about = "Traitement parallèle des traces CPU avec clusters et marges personnalisées")]
 struct Args {
     #[arg(short, long)]
     log_dir: String,
@@ -384,8 +477,25 @@ struct Args {
     #[arg(short, long)]
     kernel_logfile: String,
 
-    #[arg(short, long, default_value_t = false)]
-    crop: bool,
+    /// Écart maximal en accès entre deux copies pour former un cluster (ex: 10000)
+    #[arg(long)]
+    cluster_gap: Option<usize>,
+
+    /// Taille minimale du cluster en nombre de copies (défaut: 10)
+    #[arg(long, default_value_t = 10)]
+    min_copies: usize,
+
+    /// Rab global (avant ET après) le cluster en nombre d'accès
+    #[arg(long)]
+    roi_margin: Option<usize>,
+
+    /// Rab spécifique AVANT le cluster (prioritaire sur --roi-margin)
+    #[arg(long)]
+    margin_before: Option<usize>,
+
+    /// Rab spécifique APRÈS le cluster (prioritaire sur --roi-margin)
+    #[arg(long)]
+    margin_after: Option<usize>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -395,7 +505,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(post_log_dir)?;
     fs::create_dir_all(post_log_rc_dir)?;
 
-    eprintln!("Lecture et indexation du journal kernel : {}", args.kernel_logfile);
+    // Résolution des marges avant / après
+    let default_margin = args.roi_margin.unwrap_or(0);
+    let m_before = args.margin_before.unwrap_or(default_margin);
+    let m_after = args.margin_after.unwrap_or(default_margin);
+
+    eprintln!("Lecture du journal kernel : {}", args.kernel_logfile);
     let kernel_file = File::open(&args.kernel_logfile)?;
     let mut kernel_by_cpu: HashMap<u8, Vec<KernelRecord>> = HashMap::new();
     for line in BufReader::new(kernel_file).lines().filter_map(Result::ok) {
@@ -414,24 +529,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or(false)
         })
         .collect();
-    eprintln!("{} fichiers de traces détectés. Démarrage du traitement parallèle...\n", trace_files.len());
+
+    eprintln!(
+        "{} traces trouvées. Configuration : cluster_gap={:?}, min_copies={}, rab=[-{}, +{}]\n",
+        trace_files.len(),
+        args.cluster_gap,
+        args.min_copies,
+        m_before,
+        m_after
+    );
+
+    let gap = args.cluster_gap;
+    let min_c = args.min_copies;
     trace_files.par_iter().for_each(|trace_path| {
         if let Ok(mut p) = LogParser::new(trace_path.to_str().unwrap()) {
             if let Some(Ok(first_rec)) = p.next() {
                 let cpu_records = kernel_by_cpu.get(&first_rec.cpu).cloned().unwrap_or_default();
-                if let Err(e) = process_single_cpu_trace(trace_path, cpu_records, post_log_dir,
-                                                        post_log_rc_dir, args.crop) {
+                if let Err(e) = process_single_cpu_trace(
+                    trace_path,
+                    cpu_records,
+                    post_log_dir,
+                    post_log_rc_dir,
+                    gap,
+                    min_c,
+                    m_before,
+                    m_after,
+                ) {
                     eprintln!("[ERREUR] Échec sur {:?} : {}", trace_path, e);
                 }
             }
         }
     });
 
-    eprintln!("\nPipeline terminée avec succès !");
-    eprintln!("Fichiers générés dans :");
-    eprintln!(" - post_log/");
-    eprintln!(" - post_log_rowclone/");
-
+    eprintln!("Traitement terminé avec succès !");
+    eprintln!("Dossiers générés : post_log/ et post_log_rowclone/");
     Ok(())
-
 }

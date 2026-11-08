@@ -1,278 +1,361 @@
 use std::collections::HashMap;
-use std::fs;
+use std::fmt;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use cf_qemu_post::log_parser::{LogParser, LogRecord};
 use clap::Parser;
 use rayon::prelude::*;
 
-const PAGE_SHIFT: u64 = 12;
-const CACHELINE_MASK: u64 = !0x3F;
-const SPIN_MAX_DELTA_INSN: u64 = 16;
-const SPIN_MIN_REPEATS: usize = 3;
-const STACK_MAX_STRIDE: i64 = 128;
+const COPY_WINDOW: usize = 200;
+const COPY_WINDOW_STALE_TRESHOLD: usize = 20;
 
-// 20% de 12 Go = 2.4 Go (0x99999999)
-const TOTAL_RAM_BYTES: u64 = 12 * 1024 * 1024 * 1024;
-const SPLIT_20_80_ADDR: u64 = TOTAL_RAM_BYTES / 5;
+// Taille minimale d'un cluster en nombre de copies
+const MIN_CLUSTER_COPIES: usize = 10;
 
-// Seuil de fréquence pour identifier un "Heartbeat / Polling flag" pur en lecture seule
-// Plus de 0.5% du trafic global du CPU en LOADs purs sans STOREs
-const POLLING_HOTSPOT_SHARE_THRESHOLD: f64 = 0.005;
+static NEXT_KERNEL_REC_ID: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Parser, Debug)]
-#[command(about = "Profilage et simulation du nettoyage chirurgical de la trace mémoire QEMU")]
-struct Args {
-    /// Dossier contenant les fichiers de traces (log.txt*)
-    #[arg(short, long)]
-    log_dir: String,
+#[derive(Clone)]
+struct KernelRecord {
+    rec_id: u64,
+    cpu: u8,
+    size: u64,
+    src_address: u64,
+    dst_address: u64,
+    stale: usize,
 }
 
-#[derive(Default, Clone)]
-struct CpuProfile {
-    cpu_id: u8,
-    total_accesses: usize,
-    loads: usize,
-    stores: usize,
-
-    first_insn: u64,
-    last_insn: u64,
-    deadbeef_count: usize,
-
-    // Origine des LOAD/STORE
-    spin_wait_loads: usize,
-    spin_wasted_insns: u64,
-    seq_stream_accesses: usize,
-    stack_like_accesses: usize,
-    pointer_chasing_accesses: usize,
-    page_local_other: usize,
-
-    // Répartition fixe sur 12 Go (Bas 20% < 2.4 Go vs Haut 80% >= 2.4 Go)
-    low_ram_20pct_accesses: usize,
-    high_ram_80pct_accesses: usize,
-
-    // Détail de la simulation du nettoyage chirurgical :
-    // 1. Kernel (< 2.4 Go)
-    removed_kernel_low: usize,
-    // 2. Spin-waiting compressé (on conserve 1 lecture de verrou, on supprime les tours suivants)
-    removed_spin_collapsed: usize,
-    // 3. Heartbeats / Polling pur en lecture seule
-    removed_polling_heartbeats: usize,
-    // 4. TLB Miss / DEADBEEF
-    removed_deadbeef: usize,
-
-    total_removed_accesses: usize,
-    total_removed_insns: u64,
-
-    // Métriques après nettoyage simulé
-    cleaned_accesses: usize,
-    cleaned_insns: u64,
-    cleaned_seq_stream_accesses: usize,
-    cleaned_stack_accesses: usize,
-    cleaned_ptr_chasing: usize,
-
-    // Top 5 Hotspots
-    top_cachelines: Vec<(u64, usize, usize, usize)>,
+impl fmt::Debug for KernelRecord {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "KernelRecord {{ cpu: {}, size: {}, src: 0x{:016x}, dst: 0x{:016x} }}",
+            self.cpu, self.size, self.src_address, self.dst_address
+        )
+    }
 }
 
-impl CpuProfile {
-    fn total_insns(&self) -> u64 {
-        self.last_insn.saturating_sub(self.first_insn)
+#[derive(Clone)]
+struct MemCpy {
+    rec_id: u64,
+    from: u64,
+    to: u64,
+    size: u64,
+    current_from: u64,
+    current_to: u64,
+    associated_indices: Vec<usize>,
+    first_insn_count: u64,
+    first_global_idx: usize,
+}
+
+#[derive(Clone, Debug)]
+struct RowcloneEvent {
+    target_global_idx: usize,
+    end_global_idx: usize,
+    insn_count: u64,
+    end_insn_count: u64,
+    from: u64,
+    to: u64,
+}
+
+fn parse_hex_address(hex_str: &str) -> Option<u64> {
+    u64::from_str_radix(hex_str.trim_start_matches("0x"), 16).ok()
+}
+
+fn parse_kernel_line(line: &str) -> Option<KernelRecord> {
+    let line = line.trim();
+    if line.starts_with('#') || line.is_empty() {
+        return None;
     }
 
-    fn mpki_raw(&self) -> f64 {
-        let insns = self.total_insns();
-        if insns == 0 {
-            0.0
+    let mut parts = line.split_whitespace();
+    let cpu: u8 = parts.next()?.parse().ok()?;
+    let src_address = parse_hex_address(parts.next()?)?;
+    let dst_address = parse_hex_address(parts.next()?)?;
+
+    Some(KernelRecord {
+        rec_id: NEXT_KERNEL_REC_ID.fetch_add(1, Ordering::Relaxed),
+        cpu,
+        size: 4096,
+        src_address,
+        dst_address,
+        stale: 0,
+    })
+}
+
+fn mem_copy_match(mem_access: &LogRecord, copy: &MemCpy) -> bool {
+    (copy.current_from == mem_access.address && mem_access.store == 0)
+        || (copy.current_to == mem_access.address && mem_access.store == 1)
+}
+
+fn copy_done(copy: &MemCpy) -> bool {
+    copy.current_from >= copy.from + copy.size && copy.current_to >= copy.to + copy.size
+}
+
+fn update_copy(
+    copies: &mut Vec<MemCpy>,
+    copy_idx: usize,
+    mem_access: &LogRecord,
+    global_idx: usize,
+) -> bool {
+    let access_size_bytes = 1 << mem_access.size;
+    let copy = &mut copies[copy_idx];
+    if mem_access.store == 1 {
+        copy.current_to += access_size_bytes;
+        copy.associated_indices.push(global_idx);
+    } else if copy.current_from < copy.from + copy.size {
+        copy.current_from += access_size_bytes;
+        copy.associated_indices.push(global_idx);
+    }
+    copy_done(copy)
+}
+
+fn update_stale(rec_id: u64, copy_window: &mut Vec<KernelRecord>) {
+    for copy in copy_window {
+        if copy.rec_id < rec_id {
+            copy.stale += 1;
+        }
+    }
+}
+
+fn remove_stale_copies(
+    rec_id: u64,
+    copy_window: &mut Vec<KernelRecord>,
+    copy_logs: &mut impl Iterator<Item = KernelRecord>,
+) {
+    update_stale(rec_id, copy_window);
+    copy_window.retain(|copy| copy.stale <= COPY_WINDOW_STALE_TRESHOLD);
+
+    while copy_window.len() < COPY_WINDOW {
+        if let Some(record) = copy_logs.next() {
+            copy_window.push(record);
         } else {
-            (self.total_accesses as f64 * 1000.0) / (insns as f64)
+            return;
+        }
+    }
+}
+
+fn track_active_copies(
+    mem_access: &LogRecord,
+    active_copies: &mut Vec<MemCpy>,
+    global_idx: usize,
+    valid_indices: &mut [bool],
+    rowclone_events: &mut Vec<RowcloneEvent>,
+    copy_window: &mut Vec<KernelRecord>,
+    copy_logs: &mut impl Iterator<Item = KernelRecord>,
+) -> bool {
+    for idx in 0..active_copies.len() {
+        if mem_copy_match(mem_access, &active_copies[idx]) {
+            let done = update_copy(active_copies, idx, mem_access, global_idx);
+            if done {
+                let completed_first_idx = active_copies[idx].first_global_idx;
+                let rec_id = active_copies[idx].rec_id;
+                copy_window.retain(|i| i.rec_id != rec_id);
+                remove_stale_copies(rec_id, copy_window, copy_logs);
+
+                for &saved_idx in &active_copies[idx].associated_indices {
+                    valid_indices[saved_idx] = true;
+                }
+                rowclone_events.push(RowcloneEvent {
+                    target_global_idx: active_copies[idx].first_global_idx,
+                    end_global_idx: global_idx,
+                    insn_count: active_copies[idx].first_insn_count,
+                    end_insn_count: mem_access.insn_count,
+                    from: active_copies[idx].from,
+                    to: active_copies[idx].to,
+                });
+                active_copies.retain(|c| c.first_global_idx != completed_first_idx);
+            }
+            return true;
+        }
+    }
+    false
+}
+
+fn check_potential_copy_start(
+    mem_access: &LogRecord,
+    copy_window: &[KernelRecord],
+    potential_copies: &mut Vec<MemCpy>,
+    global_idx: usize,
+) -> bool {
+    let mut potential_copy = false;
+    for copy in copy_window {
+        let is_start = mem_access.store == 0 && copy.src_address == mem_access.address;
+
+        if is_start {
+            let mut existing = false;
+            for pot_copy in potential_copies.iter_mut() {
+                if pot_copy.rec_id == copy.rec_id {
+                    if pot_copy.current_to == pot_copy.to {
+                        pot_copy.associated_indices.clear();
+                        pot_copy.first_insn_count = mem_access.insn_count;
+                        pot_copy.first_global_idx = global_idx;
+                        pot_copy.associated_indices.push(global_idx);
+
+                        let access_size_bytes = 1 << mem_access.size;
+                        pot_copy.current_from = mem_access.address + access_size_bytes;
+                        potential_copy = true;
+                    }
+                    existing = true;
+                    break;
+                }
+            }
+            if !existing {
+                let access_size_bytes = 1 << mem_access.size;
+                let mut indices = Vec::with_capacity(768);
+                indices.push(global_idx);
+                potential_copies.push(MemCpy {
+                    rec_id: copy.rec_id,
+                    from: mem_access.address,
+                    to: copy.dst_address,
+                    size: copy.size,
+                    current_from: mem_access.address + access_size_bytes,
+                    current_to: copy.dst_address,
+                    associated_indices: indices,
+                    first_insn_count: mem_access.insn_count,
+                    first_global_idx: global_idx,
+                });
+                potential_copy = true;
+            }
+        }
+    }
+    potential_copy
+}
+
+struct CpuData {
+    records: Vec<LogRecord>,
+    events: Vec<RowcloneEvent>,
+}
+
+#[derive(Clone, Debug)]
+struct ClusterResult {
+    max_gap_threshold: usize,
+    total_clusters: usize,
+    clones_in_clusters: usize,
+    avg_cluster_size: f64,
+    avg_intra_cluster_gap_acc: f64,
+    avg_intra_cluster_gap_insn: f64,
+    max_cluster_size: usize,
+    total_retained_insns: u64,
+    total_retained_accesses: usize,
+}
+
+fn evaluate_clustering(cpu_data_list: &[CpuData], max_gap: usize, min_copies: usize) -> ClusterResult {
+    let mut total_clusters = 0usize;
+    let mut clones_in_clusters = 0usize;
+    let mut intra_cluster_gaps_acc = Vec::new();
+    let mut intra_cluster_gaps_insn = Vec::new();
+    let mut max_cluster_size = 0usize;
+
+    let mut total_retained_insns = 0u64;
+    let mut total_retained_accesses = 0usize;
+
+    for data in cpu_data_list {
+        if data.events.is_empty() {
+            continue;
+        }
+
+        let mut current_cluster: Vec<RowcloneEvent> = vec![data.events[0].clone()];
+        let mut cpu_cluster_spans: Vec<(usize, usize)> = Vec::new();
+
+        for w in data.events.windows(2) {
+            let acc_gap = w[1].target_global_idx.saturating_sub(w[0].end_global_idx);
+            let insn_gap = w[1].insn_count.saturating_sub(w[0].end_insn_count);
+
+            if acc_gap <= max_gap {
+                current_cluster.push(w[1].clone());
+            } else {
+                if current_cluster.len() >= min_copies {
+                    total_clusters += 1;
+                    clones_in_clusters += current_cluster.len();
+                    max_cluster_size = max_cluster_size.max(current_cluster.len());
+
+                    for win in current_cluster.windows(2) {
+                        intra_cluster_gaps_acc.push(win[1].target_global_idx.saturating_sub(win[0].end_global_idx));
+                        intra_cluster_gaps_insn.push(win[1].insn_count.saturating_sub(win[0].end_insn_count));
+                    }
+
+                    let s_idx = current_cluster.first().unwrap().target_global_idx;
+                    let e_idx = current_cluster.last().unwrap().end_global_idx;
+                    cpu_cluster_spans.push((s_idx, e_idx));
+                }
+                current_cluster.clear();
+                current_cluster.push(w[1].clone());
+            }
+        }
+
+        if current_cluster.len() >= min_copies {
+            total_clusters += 1;
+            clones_in_clusters += current_cluster.len();
+            max_cluster_size = max_cluster_size.max(current_cluster.len());
+
+            for win in current_cluster.windows(2) {
+                intra_cluster_gaps_acc.push(win[1].target_global_idx.saturating_sub(win[0].end_global_idx));
+                intra_cluster_gaps_insn.push(win[1].insn_count.saturating_sub(win[0].end_insn_count));
+            }
+
+            let s_idx = current_cluster.first().unwrap().target_global_idx;
+            let e_idx = current_cluster.last().unwrap().end_global_idx;
+            cpu_cluster_spans.push((s_idx, e_idx));
+        }
+
+        for (s, e) in cpu_cluster_spans {
+            let acc_count = e.saturating_sub(s) + 1;
+            let insn_count = data.records[e].insn_count.saturating_sub(data.records[s].insn_count);
+            total_retained_accesses += acc_count;
+            total_retained_insns += insn_count;
         }
     }
 
-    fn mpki_cleaned(&self) -> f64 {
-        if self.cleaned_insns == 0 {
-            0.0
-        } else {
-            (self.cleaned_accesses as f64 * 1000.0) / (self.cleaned_insns as f64)
-        }
-    }
-}
-
-fn profile_single_cpu_trace(trace_path: &Path) -> Result<Option<CpuProfile>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut parser = LogParser::new(trace_path.to_str().unwrap())?;
-    let mut records: Vec<LogRecord> = Vec::new();
-
-    while let Some(Ok(record)) = parser.next() {
-        records.push(record);
-    }
-
-    if records.is_empty() {
-        return Ok(None);
-    }
-
-    let mut prof = CpuProfile {
-        cpu_id: records[0].cpu,
-        total_accesses: records.len(),
-        first_insn: records[0].insn_count,
-        last_insn: records.last().unwrap().insn_count,
-        ..Default::default()
+    let avg_cluster_size = if total_clusters > 0 {
+        clones_in_clusters as f64 / total_clusters as f64
+    } else {
+        0.0
     };
 
-    // Passe 1 : Identifier la fréquence de chaque ligne de cache pour repérer les drapeaux de polling pur (Heartbeats)
-    let mut cl_map: HashMap<u64, (usize, usize, usize)> = HashMap::with_capacity(65536);
-    for rec in &records {
-        if rec.address == 0xDEADBEEF {
-            continue;
-        }
-        let cl_addr = rec.address & CACHELINE_MASK;
-        let entry = cl_map.entry(cl_addr).or_insert((0, 0, 0));
-        entry.0 += 1;
-        if rec.store != 0 {
-            entry.2 += 1;
-        } else {
-            entry.1 += 1;
-        }
+    let avg_gap_acc = if !intra_cluster_gaps_acc.is_empty() {
+        intra_cluster_gaps_acc.iter().sum::<usize>() as f64 / intra_cluster_gaps_acc.len() as f64
+    } else {
+        0.0
+    };
+
+    let avg_gap_insn = if !intra_cluster_gaps_insn.is_empty() {
+        intra_cluster_gaps_insn.iter().sum::<u64>() as f64 / intra_cluster_gaps_insn.len() as f64
+    } else {
+        0.0
+    };
+
+    ClusterResult {
+        max_gap_threshold: max_gap,
+        total_clusters,
+        clones_in_clusters,
+        avg_cluster_size,
+        avg_intra_cluster_gap_acc: avg_gap_acc,
+        avg_intra_cluster_gap_insn: avg_gap_insn,
+        max_cluster_size,
+        total_retained_insns,
+        total_retained_accesses,
     }
+}
 
-    // Définition des lignes de cache "Heartbeats / Polling pur" :
-    // Très fréquentes (> 0.5% du CPU) et 100% lectures seules (ex: table ou flag sondé en permanence par des démons)
-    let heartbeat_threshold = ((records.len() as f64) * POLLING_HOTSPOT_SHARE_THRESHOLD) as usize;
-    let heartbeat_cachelines: HashMap<u64, usize> = cl_map
-        .iter()
-        .filter(|(_, v)| v.0 >= heartbeat_threshold && v.2 == 0 && v.1 == v.0)
-        .map(|(&addr, _)| (addr, 0))
-        .collect();
+#[derive(Parser, Debug)]
+#[command(about = "Optimisation du clustering RowClone avec grille de seuils étendue")]
+struct Args {
+    #[arg(short, long)]
+    log_dir: String,
 
-    // Passe 2 : Profilage détaillé + Nettoyage chirurgical (Collapsing + Kernel + Polling)
-    let mut prev_addr: u64 = 0;
-    let mut prev_insn: u64 = records[0].insn_count;
+    #[arg(short, long)]
+    kernel_logfile: String,
 
-    let mut recent_cl_window = [0u64; 4];
-    let mut win_idx = 0usize;
-    let mut current_spin_streak = 0usize;
-    let mut streak_insns = 0u64;
+    /// Seuil minimum de copies par cluster (défaut: 10)
+    #[arg(long, default_value_t = MIN_CLUSTER_COPIES)]
+    min_copies: usize,
 
-    for (i, rec) in records.iter().enumerate() {
-        let is_store = rec.store != 0;
-        if is_store {
-            prof.stores += 1;
-        } else {
-            prof.loads += 1;
-        }
-
-        let delta_insn = rec.insn_count.saturating_sub(prev_insn);
-
-        if rec.address == 0xDEADBEEF {
-            prof.deadbeef_count += 1;
-            prof.removed_deadbeef += 1;
-            prof.total_removed_accesses += 1;
-            prof.total_removed_insns += delta_insn;
-            prev_insn = rec.insn_count;
-            continue;
-        }
-
-        let is_low_ram = rec.address < SPLIT_20_80_ADDR;
-        if is_low_ram {
-            prof.low_ram_20pct_accesses += 1;
-        } else {
-            prof.high_ram_80pct_accesses += 1;
-        }
-
-        let cl_addr = rec.address & CACHELINE_MASK;
-        let stride = (rec.address as i128 - prev_addr as i128) as i64;
-        let abs_stride = stride.saturating_abs();
-
-        let in_recent_window = recent_cl_window.contains(&cl_addr);
-        let mut is_redundant_spin_iteration = false;
-
-        if !is_store && in_recent_window && delta_insn <= SPIN_MAX_DELTA_INSN && i > 0 {
-            current_spin_streak += 1;
-            streak_insns += delta_insn;
-
-            if current_spin_streak == SPIN_MIN_REPEATS {
-                prof.spin_wait_loads += SPIN_MIN_REPEATS;
-                prof.spin_wasted_insns += streak_insns;
-                // Collapsing : on préserve la 1re tentative de lecture légitime,
-                // on ne supprime que les répétitions artificielles (les tours > 1)
-                is_redundant_spin_iteration = true;
-            } else if current_spin_streak > SPIN_MIN_REPEATS {
-                prof.spin_wait_loads += 1;
-                prof.spin_wasted_insns += delta_insn;
-                is_redundant_spin_iteration = true;
-            } else {
-                prof.page_local_other += 1;
-            }
-        } else {
-            current_spin_streak = 0;
-            streak_insns = 0;
-
-            if stride == 8 || stride == 16 || stride == 4 || stride == 64 {
-                prof.seq_stream_accesses += 1;
-            } else if abs_stride > 0 && abs_stride <= STACK_MAX_STRIDE {
-                prof.stack_like_accesses += 1;
-            } else if (rec.address >> PAGE_SHIFT) != (prev_addr >> PAGE_SHIFT) {
-                prof.pointer_chasing_accesses += 1;
-            } else {
-                prof.page_local_other += 1;
-            }
-        }
-
-        // --- RÈGLES DE NETTOYAGE CHIRURGICAL ---
-        // Règle 1 : Bruit Kernel (< 2.4 Go) -> 100% interruptions et scheduler artificiels
-        if is_low_ram {
-            prof.removed_kernel_low += 1;
-            prof.total_removed_accesses += 1;
-            prof.total_removed_insns += delta_insn;
-        }
-        // Règle 2 : Spinlock Collapsing -> Suppression des tours de boucle redondants (>= 2e répétition)
-        else if is_redundant_spin_iteration {
-            prof.removed_spin_collapsed += 1;
-            prof.total_removed_accesses += 1;
-            prof.total_removed_insns += delta_insn;
-        }
-        // Règle 3 : Heartbeats de fond -> drapeaux 100% RO martelés par les démons système
-        else if !is_store && heartbeat_cachelines.contains_key(&cl_addr) && delta_insn <= 32 {
-            prof.removed_polling_heartbeats += 1;
-            prof.total_removed_accesses += 1;
-            prof.total_removed_insns += delta_insn;
-        }
-        // Accès conservé dans la trace épurée (Trafic applicatif réel)
-        else {
-            if stride == 8 || stride == 16 || stride == 4 || stride == 64 {
-                prof.cleaned_seq_stream_accesses += 1;
-            } else if abs_stride > 0 && abs_stride <= STACK_MAX_STRIDE {
-                prof.cleaned_stack_accesses += 1;
-            } else if (rec.address >> PAGE_SHIFT) != (prev_addr >> PAGE_SHIFT) {
-                prof.cleaned_ptr_chasing += 1;
-            }
-        }
-
-        recent_cl_window[win_idx] = cl_addr;
-        win_idx = (win_idx + 1) % recent_cl_window.len();
-
-        prev_addr = rec.address;
-        prev_insn = rec.insn_count;
-    }
-
-    let total_categorized = prof.spin_wait_loads
-        + prof.seq_stream_accesses
-        + prof.stack_like_accesses
-        + prof.pointer_chasing_accesses;
-    let valid_total = prof.total_accesses.saturating_sub(prof.deadbeef_count);
-    prof.page_local_other = valid_total.saturating_sub(total_categorized);
-
-    prof.cleaned_accesses = prof.total_accesses.saturating_sub(prof.total_removed_accesses);
-    prof.cleaned_insns = prof.total_insns().saturating_sub(prof.total_removed_insns);
-
-    let mut cl_vec: Vec<(u64, usize, usize, usize)> = cl_map
-        .into_iter()
-        .map(|(addr, (tot, ld, st))| (addr, tot, ld, st))
-        .collect();
-    cl_vec.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-    cl_vec.truncate(5);
-    prof.top_cachelines = cl_vec;
-
-    Ok(Some(prof))
+    /// Tester un écart personnalisé spécifique
+    #[arg(long)]
+    custom_gap: Option<usize>,
 }
 
 fn pct(part: usize, total: usize) -> f64 {
@@ -283,156 +366,25 @@ fn pct(part: usize, total: usize) -> f64 {
     }
 }
 
-fn print_cpu_report(p: &CpuProfile) {
-    let valid = p.total_accesses.saturating_sub(p.deadbeef_count).max(1);
-    let tot_insns = p.total_insns();
-    let wasted_insn_pct = if tot_insns > 0 {
-        (p.spin_wasted_insns as f64 * 100.0) / (tot_insns as f64)
-    } else {
+fn pct_u64(part: u64, total: u64) -> f64 {
+    if total == 0 {
         0.0
-    };
-
-    println!("==========================================================================================");
-    println!(
-        " [CPU {:>2}]  Accès: {:>12} | Instructions: {:>12} | Intensité brute: {:>6.2} MPKI",
-        p.cpu_id, p.total_accesses, tot_insns, p.mpki_raw()
-    );
-    println!("==========================================================================================");
-    println!(
-        "  MIX R/W       : LOADs: {:>5.1}% ({}) | STOREs: {:>5.1}% ({})",
-        pct(p.loads, p.total_accesses),
-        p.loads,
-        pct(p.stores, p.total_accesses),
-        p.stores
-    );
-    println!(
-        "  RAM (12 Go)   : Bas 20% (< 2.4 Go) = {:>5.1}% | Haut 80% (>= 2.4 Go) = {:>5.1}%",
-        pct(p.low_ram_20pct_accesses, valid),
-        pct(p.high_ram_80pct_accesses, valid)
-    );
-    println!("\n  ORIGINE DES ACCÈS :");
-    println!(
-        "  - Spin-Waiting (Verrous)   : {:>6.2}% ({:>10} accès) -> {:.1}% des instructions CPU",
-        pct(p.spin_wait_loads, valid),
-        p.spin_wait_loads,
-        wasted_insn_pct
-    );
-    println!(
-        "  - Séquentiels (Copies)     : {:>6.2}% ({:>10} accès)",
-        pct(p.seq_stream_accesses, valid),
-        p.seq_stream_accesses
-    );
-    println!(
-        "  - Pile / Contexte (<128B)  : {:>6.2}% ({:>10} accès)",
-        pct(p.stack_like_accesses, valid),
-        p.stack_like_accesses
-    );
-    println!(
-        "  - Sauts Inter-Pages (4K)   : {:>6.2}% ({:>10} accès)",
-        pct(p.pointer_chasing_accesses, valid),
-        p.pointer_chasing_accesses
-    );
-    println!(
-        "  - Autres intra-page        : {:>6.2}% ({:>10} accès)",
-        pct(p.page_local_other, valid),
-        p.page_local_other
-    );
-
-    println!("\n  >>> SIMULATION DU NETTOYAGE CHIRURGICAL :");
-    println!(
-        "  - Parasites Kernel (<2.4G)      : {:>5.2}% ({:>10} accès) -> IRQs, ticks horloge, scheduler",
-        pct(p.removed_kernel_low, p.total_accesses),
-        p.removed_kernel_low
-    );
-    println!(
-        "  - Spin-Waiting Effondré         : {:>5.2}% ({:>10} accès) -> Tours redondants de verrous MTTCG",
-        pct(p.removed_spin_collapsed, p.total_accesses),
-        p.removed_spin_collapsed
-    );
-    println!(
-        "  - Heartbeats / Polling pur (RO) : {:>5.2}% ({:>10} accès) -> Sondages périodiques de démons",
-        pct(p.removed_polling_heartbeats, p.total_accesses),
-        p.removed_polling_heartbeats
-    );
-    println!(
-        "  * TOTAL ACCÈS PURGÉS            : {:>5.2}% ({:>10} accès éliminés)",
-        pct(p.total_removed_accesses, p.total_accesses),
-        p.total_removed_accesses
-    );
-    println!(
-        "  * TOTAL INSTRUCTIONS SOUSTRAITES: {:>5.2}% ({:>10} instructions compensées)",
-        if tot_insns > 0 { (p.total_removed_insns as f64 * 100.0) / tot_insns as f64 } else { 0.0 },
-        p.total_removed_insns
-    );
-    println!(
-        "  * NOUVELLE DENSITÉ DE COPIES    : {:>5.2}% (était à {:.2}% dans la trace brute)",
-        pct(p.cleaned_seq_stream_accesses, p.cleaned_accesses),
-        pct(p.seq_stream_accesses, p.total_accesses)
-    );
-    println!(
-        "  * NOUVEAU MPKI APPLICATIF       : {:.2} (était à {:.2})",
-        p.mpki_cleaned(),
-        p.mpki_raw()
-    );
-
-    println!("\n  TOP 5 HOTSPOTS (Lignes de cache 64B) :");
-    for (addr, tot, ld, st) in &p.top_cachelines {
-        println!(
-            "  * 0x{:012x} : {:>9} accès ({:>5.2}%) [LD: {:>8}, ST: {:>8}]",
-            addr,
-            tot,
-            pct(*tot, valid),
-            ld,
-            st
-        );
+    } else {
+        (part as f64 * 100.0) / (total as f64)
     }
-    println!();
-}
-
-fn print_global_summary(profiles: &[CpuProfile]) {
-    if profiles.is_empty() {
-        return;
-    }
-
-    let total_acc: usize = profiles.iter().map(|p| p.total_accesses).sum();
-    let total_insns: u64 = profiles.iter().map(|p| p.total_insns()).sum();
-    let total_removed_acc: usize = profiles.iter().map(|p| p.total_removed_accesses).sum();
-    let total_removed_insns: u64 = profiles.iter().map(|p| p.total_removed_insns).sum();
-    let total_rem_kernel: usize = profiles.iter().map(|p| p.removed_kernel_low).sum();
-    let total_rem_spin: usize = profiles.iter().map(|p| p.removed_spin_collapsed).sum();
-    let total_rem_heartbeat: usize = profiles.iter().map(|p| p.removed_polling_heartbeats).sum();
-    let total_raw_seq: usize = profiles.iter().map(|p| p.seq_stream_accesses).sum();
-    let total_clean_seq: usize = profiles.iter().map(|p| p.cleaned_seq_stream_accesses).sum();
-
-    let cleaned_acc = total_acc.saturating_sub(total_removed_acc);
-    let cleaned_insns = total_insns.saturating_sub(total_removed_insns);
-
-    println!("##########################################################################################");
-    println!("        SYNTHÈSE GLOBALE MULTI-CŒURS : NETTOYAGE CHIRURGICAL DU BRUIT ({} CPUs)", profiles.len());
-    println!("##########################################################################################");
-    println!("  TRACE BRUTE :");
-    println!("  - Accès Mémoire Totaux        : {}", total_acc);
-    println!("  - Instructions Totales        : {}", total_insns);
-    println!("  - MPKI Brut Global            : {:.2}", (total_acc as f64 * 1000.0) / (total_insns.max(1) as f64));
-    println!("  - Densité initiale des copies : {:.2}% ({} accès séquentiels)", pct(total_raw_seq, total_acc), total_raw_seq);
-    println!("------------------------------------------------------------------------------------------");
-    println!("  BILAN DES ACCÈS PARASITES DUS À LA LENTEUR QEMU / MTTCG :");
-    println!("  - 1. Bruit Kernel (<2.4G)     : {:>5.2}% ({} accès) [Ticks, IRQs, Sauvegardes pile]", pct(total_rem_kernel, total_acc), total_rem_kernel);
-    println!("  - 2. Tours de Spinlock en trop: {:>5.2}% ({} accès) [Attente active sous MTTCG]", pct(total_rem_spin, total_acc), total_rem_spin);
-    println!("  - 3. Heartbeats / Polling RO  : {:>5.2}% ({} accès) [Polling périodique des démons]", pct(total_rem_heartbeat, total_acc), total_rem_heartbeat);
-    println!("  * TOTAL DU BRUIT PURGÉ        : {:>5.2}% ({} accès artificiels éliminés)", pct(total_removed_acc, total_acc), total_removed_acc);
-    println!("  * TOTAL INSTRUCTIONS EFFACÉES : {:>5.2}% ({} instructions d'attente compensées)", if total_insns > 0 { (total_removed_insns as f64 * 100.0) / total_insns as f64 } else { 0.0 }, total_removed_insns);
-    println!("------------------------------------------------------------------------------------------");
-    println!("  TRACE NETTOYÉE RÉALISTE (Ce que Ramulator verra) :");
-    println!("  - Accès Mémoire Utiles        : {} (soit {:.1}% du volume d'origine)", cleaned_acc, pct(cleaned_acc, total_acc));
-    println!("  - Instructions Utiles         : {}", cleaned_insns);
-    println!("  - MPKI Applicatif Global      : {:.2} (reflète la vraie intensité hors bruit)", (cleaned_acc as f64 * 1000.0) / (cleaned_insns.max(1) as f64));
-    println!("  - NOUVELLE DENSITÉ DES COPIES : {:.2}% (concentration de RowClone multipliée)", pct(total_clean_seq, cleaned_acc));
-    println!("##########################################################################################\n");
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+
+    eprintln!("Indexation du journal noyau : {}", args.kernel_logfile);
+    let kernel_file = File::open(&args.kernel_logfile)?;
+    let mut kernel_by_cpu: HashMap<u8, Vec<KernelRecord>> = HashMap::new();
+    for line in BufReader::new(kernel_file).lines().filter_map(Result::ok) {
+        if let Some(record) = parse_kernel_line(&line) {
+            kernel_by_cpu.entry(record.cpu).or_default().push(record);
+        }
+    }
 
     let mut trace_files: Vec<PathBuf> = fs::read_dir(&args.log_dir)?
         .filter_map(Result::ok)
@@ -446,19 +398,117 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
 
     trace_files.sort();
+    eprintln!("Extraction des traces et copies RowClone sur {} fichiers...", trace_files.len());
 
-    let mut profiles: Vec<CpuProfile> = trace_files
+    let cpu_data_list: Vec<CpuData> = trace_files
         .par_iter()
-        .filter_map(|trace_path| profile_single_cpu_trace(trace_path).ok().flatten())
+        .filter_map(|trace_path| {
+            let mut parser = LogParser::new(trace_path.to_str().unwrap()).ok()?;
+            let mut records = Vec::new();
+            while let Some(Ok(rec)) = parser.next() {
+                records.push(rec);
+            }
+            if records.is_empty() {
+                return None;
+            }
+            let cpu_id = records[0].cpu;
+            let cpu_records = kernel_by_cpu.get(&cpu_id).cloned().unwrap_or_default();
+            let mut kernel_iter = cpu_records.into_iter();
+            let mut copy_window: Vec<KernelRecord> = kernel_iter.by_ref().take(COPY_WINDOW).collect();
+            let mut active_copies = Vec::new();
+            let mut valid_indices = vec![false; records.len()];
+            let mut rowclone_events = Vec::new();
+
+            for (idx, mem_access) in records.iter().enumerate() {
+                if track_active_copies(
+                    mem_access,
+                    &mut active_copies,
+                    idx,
+                    &mut valid_indices,
+                    &mut rowclone_events,
+                    &mut copy_window,
+                    &mut kernel_iter,
+                ) {
+                    continue;
+                }
+                check_potential_copy_start(mem_access, &copy_window, &mut active_copies, idx);
+            }
+            Some(CpuData {
+                records,
+                events: rowclone_events,
+            })
+        })
         .collect();
 
-    profiles.sort_by_key(|p| p.cpu_id);
+    let total_rc: usize = cpu_data_list.iter().map(|d| d.events.len()).sum();
+    let total_raw_insns: u64 = cpu_data_list.iter().map(|d| {
+        let first = d.records.first().map_or(0, |r| r.insn_count);
+        let last = d.records.last().map_or(0, |r| r.insn_count);
+        last.saturating_sub(first)
+    }).sum();
+    let total_raw_accesses: usize = cpu_data_list.iter().map(|d| d.records.len()).sum();
 
-    for prof in &profiles {
-        print_cpu_report(prof);
+    println!("\n==========================================================================================");
+    println!(
+        " TRACE BRUTE : {} accès | {} instructions | {} RowClones détectés",
+        total_raw_accesses, total_raw_insns, total_rc
+    );
+    println!(" FILTRAGE : Seuls les clusters contenant au moins {} copies sont retenus", args.min_copies);
+    println!("==========================================================================================");
+
+    if total_rc < args.min_copies {
+        println!("Nombre insuffisant de copies pour former un cluster de taille >= {}.", args.min_copies);
+        return Ok(());
     }
 
-    print_global_summary(&profiles);
+    // Grille de seuils enrichie : résolution fine (5k - 20k) + seuils macroscopiques (jusqu'à 1M)
+    let mut candidate_gaps = vec![
+        1_000, 2_000, 3_000, 4_000, 5_000, 6_000, 7_500, 8_500, 10_000,
+        12_500, 15_000, 20_000, 25_000, 30_000, 40_000, 50_000, 75_000,
+        100_000, 150_000, 200_000, 500_000, 1_000_000, 2_000_000, 5_000_000, 10_000_000
+    ];
+
+    if let Some(custom) = args.custom_gap {
+        if !candidate_gaps.contains(&custom) {
+            candidate_gaps.push(custom);
+            candidate_gaps.sort_unstable();
+        }
+    }
+
+    let min_c = args.min_copies;
+    let results: Vec<ClusterResult> = candidate_gaps
+        .iter()
+        .map(|&gap| evaluate_clustering(&cpu_data_list, gap, min_c))
+        .collect();
+
+    println!("\n#################################################################################################################################################################");
+    println!("                        BALAYAGE DES SEUILS : CLUSTERS D'AU MOINS {} COPIES (NOMBRE D'INSTRUCTIONS ET VOLUMES)", min_c);
+    println!("#################################################################################################################################################################");
+    println!(
+        "{:<9} | {:<9} | {:<12} | {:<10} | {:<16} | {:<15} | {:<15} | {:<22} | {:<16}",
+        "Seuil Gap", "Nb Clust.", "Taille Moy.", "Taille Max", "Copies Couvertes", "Écart Moy. Acc.", "Écart Moy. Insn", "Instructions Gardées", "Accès Gardés"
+    );
+    println!("{:-<161}", "");
+
+    for r in &results {
+        println!(
+            "{:>8}  | {:>9}  | {:>10.1}   | {:>10} | {:>6}/{} ({:>5.1}%) | {:>15.1} | {:>15.1} | {:>12} ({:>5.2}%) | {:>9} ({:>5.2}%)",
+            r.max_gap_threshold,
+            r.total_clusters,
+            r.avg_cluster_size,
+            r.max_cluster_size,
+            r.clones_in_clusters,
+            total_rc,
+            pct(r.clones_in_clusters, total_rc),
+            r.avg_intra_cluster_gap_acc,
+            r.avg_intra_cluster_gap_insn,
+            r.total_retained_insns,
+            pct_u64(r.total_retained_insns, total_raw_insns),
+            r.total_retained_accesses,
+            pct(r.total_retained_accesses, total_raw_accesses),
+        );
+    }
+    println!("#################################################################################################################################################################\n");
 
     Ok(())
 }
