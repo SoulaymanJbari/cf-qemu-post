@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use cf_qemu_post::log_parser::{LogParser, LogRecord};
@@ -58,6 +58,7 @@ struct RowcloneEvent {
     end_insn_count: u64,
     from: u64,
     to: u64,
+    ttbr0: u64,
 }
 
 fn parse_hex_address(hex_str: &str) -> Option<u64> {
@@ -138,6 +139,7 @@ fn remove_stale_copies(
 }
 
 fn track_active_copies(
+    records: &[LogRecord],
     mem_access: &LogRecord,
     active_copies: &mut Vec<MemCpy>,
     global_idx: usize,
@@ -158,6 +160,10 @@ fn track_active_copies(
                 for &saved_idx in &active_copies[idx].associated_indices {
                     valid_indices[saved_idx] = true;
                 }
+
+                let first_rec = &records[active_copies[idx].first_global_idx];
+                let ttbr0_phys = (first_rec.ttbr0_pfn as u64) << 12;
+
                 rowclone_events.push(RowcloneEvent {
                     target_global_idx: active_copies[idx].first_global_idx,
                     end_global_idx: global_idx,
@@ -165,6 +171,7 @@ fn track_active_copies(
                     end_insn_count: mem_access.insn_count,
                     from: active_copies[idx].from,
                     to: active_copies[idx].to,
+                    ttbr0: ttbr0_phys,
                 });
                 active_copies.retain(|c| c.first_global_idx != completed_first_idx);
             }
@@ -227,6 +234,84 @@ fn check_potential_copy_start(
 struct CpuData {
     records: Vec<LogRecord>,
     events: Vec<RowcloneEvent>,
+}
+
+#[derive(Default)]
+struct Ttbr0Stats {
+    total_accesses: usize,
+    loads: usize,
+    stores: usize,
+    rowclones: usize,
+    first_insn: u64,
+    last_insn: u64,
+    cpus: BTreeSet<u8>,
+}
+
+fn display_ttbr0_statistics(cpu_data_list: &[CpuData]) {
+    let mut stats_map: HashMap<u64, Ttbr0Stats> = HashMap::new();
+
+    for data in cpu_data_list {
+        for rec in &data.records {
+            let ttbr0 = (rec.ttbr0_pfn as u64) << 12;
+            let entry = stats_map.entry(ttbr0).or_insert_with(|| Ttbr0Stats {
+                first_insn: rec.insn_count,
+                last_insn: rec.insn_count,
+                ..Default::default()
+            });
+
+            entry.total_accesses += 1;
+            if rec.store == 1 {
+                entry.stores += 1;
+            } else {
+                entry.loads += 1;
+            }
+
+            entry.last_insn = entry.last_insn.max(rec.insn_count);
+            entry.first_insn = entry.first_insn.min(rec.insn_count);
+            entry.cpus.insert(rec.cpu as u8);
+        }
+
+        for ev in &data.events {
+            if let Some(entry) = stats_map.get_mut(&ev.ttbr0) {
+                entry.rowclones += 1;
+            }
+        }
+    }
+
+    let grand_total_accesses: usize = stats_map.values().map(|s| s.total_accesses).sum();
+    let grand_total_rc: usize = stats_map.values().map(|s| s.rowclones).sum();
+
+    let mut sorted_stats: Vec<(u64, Ttbr0Stats)> = stats_map.into_iter().collect();
+    sorted_stats.sort_by(|a, b| b.1.total_accesses.cmp(&a.1.total_accesses));
+
+    println!("\n#################################################################################################################################");
+    println!("                                      PROFILAGE PAR PROCESSUS (TTBR0_EL1)");
+    println!("#################################################################################################################################");
+    println!(
+        "{:<18} | {:<12} | {:<8} | {:<12} | {:<12} | {:<10} | {:<10} | {:<10}",
+        "TTBR0 Physique", "Accès Totaux", "% Trace", "LOADs", "STOREs", "RowClones", "% RC", "CPUs Vus"
+    );
+    println!("{:-<129}", "");
+
+    for (ttbr0, s) in &sorted_stats {
+        let pct_trace = (s.total_accesses as f64 * 100.0) / (grand_total_accesses.max(1) as f64);
+        let pct_rc = (s.rowclones as f64 * 100.0) / (grand_total_rc.max(1) as f64);
+        let cpus_vec: Vec<u8> = s.cpus.iter().copied().collect();
+        let cpus_str = format!("{:?}", cpus_vec);
+
+        println!(
+            "0x{:016x} | {:>12} | {:>7.2}% | {:>12} | {:>12} | {:>10} | {:>9.1}% | {:<10}",
+            ttbr0,
+            s.total_accesses,
+            pct_trace,
+            s.loads,
+            s.stores,
+            s.rowclones,
+            pct_rc,
+            cpus_str
+        );
+    }
+    println!("#################################################################################################################################\n");
 }
 
 #[derive(Clone, Debug)]
@@ -411,7 +496,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if records.is_empty() {
                 return None;
             }
-            let cpu_id = records[0].cpu;
+            let cpu_id = records[0].cpu as u8;
             let cpu_records = kernel_by_cpu.get(&cpu_id).cloned().unwrap_or_default();
             let mut kernel_iter = cpu_records.into_iter();
             let mut copy_window: Vec<KernelRecord> = kernel_iter.by_ref().take(COPY_WINDOW).collect();
@@ -419,9 +504,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut valid_indices = vec![false; records.len()];
             let mut rowclone_events = Vec::new();
 
-            for (idx, mem_access) in records.iter().enumerate() {
+            for idx in 0..records.len() {
+                let mem_access = records[idx];
                 if track_active_copies(
-                    mem_access,
+                    &records,
+                    &mem_access,
                     &mut active_copies,
                     idx,
                     &mut valid_indices,
@@ -431,7 +518,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ) {
                     continue;
                 }
-                check_potential_copy_start(mem_access, &copy_window, &mut active_copies, idx);
+                check_potential_copy_start(&mem_access, &copy_window, &mut active_copies, idx);
             }
             Some(CpuData {
                 records,
@@ -455,6 +542,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!(" FILTRAGE : Seuls les clusters contenant au moins {} copies sont retenus", args.min_copies);
     println!("==========================================================================================");
+
+    // Profilage global par TTBR0
+    display_ttbr0_statistics(&cpu_data_list);
 
     if total_rc < args.min_copies {
         println!("Nombre insuffisant de copies pour former un cluster de taille >= {}.", args.min_copies);

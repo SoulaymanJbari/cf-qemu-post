@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
@@ -55,6 +55,7 @@ struct RowcloneEvent {
     end_insn_count: u64,
     from: u64,
     to: u64,
+    ttbr0: u64,
 }
 
 fn parse_hex_address(hex_str: &str) -> Option<u64> {
@@ -135,6 +136,7 @@ fn remove_stale_copies(
 }
 
 fn track_active_copies(
+    records: &[LogRecord],
     mem_access: &LogRecord,
     active_copies: &mut Vec<MemCpy>,
     global_idx: usize,
@@ -155,6 +157,10 @@ fn track_active_copies(
                 for &saved_idx in &active_copies[idx].associated_indices {
                     valid_indices[saved_idx] = true;
                 }
+
+                let first_rec = &records[active_copies[idx].first_global_idx];
+                let ttbr0_phys = (first_rec.ttbr0_pfn as u64) << 12;
+
                 rowclone_events.push(RowcloneEvent {
                     target_global_idx: active_copies[idx].first_global_idx,
                     end_global_idx: global_idx,
@@ -162,6 +168,7 @@ fn track_active_copies(
                     end_insn_count: mem_access.insn_count,
                     from: active_copies[idx].from,
                     to: active_copies[idx].to,
+                    ttbr0: ttbr0_phys,
                 });
                 active_copies.retain(|c| c.first_global_idx != completed_first_idx);
             }
@@ -221,7 +228,6 @@ fn check_potential_copy_start(
     potential_copy
 }
 
-// Formatage Ramulator
 struct RamulatorFormatter<W: Write> {
     writer: BufWriter<W>,
     prev_insn_count: u64,
@@ -293,6 +299,7 @@ fn process_single_cpu_trace(
     min_cluster_copies: usize,
     margin_before: usize,
     margin_after: usize,
+    allowed_ttbr0_pfns: Option<&HashSet<u32>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut parser = LogParser::new(trace_path.to_str().unwrap())?;
     let mut baseline_history: Vec<LogRecord> = Vec::new();
@@ -316,10 +323,12 @@ fn process_single_cpu_trace(
     let mut valid_indices = vec![false; baseline_history.len()];
     let mut rowclone_events: Vec<RowcloneEvent> = Vec::new();
 
-    // PASSE 1 : Détection 100% fidèle sur trace brute
-    for (current_idx, mem_access) in baseline_history.iter().enumerate() {
+    // PASSE 1 : Détection fidèle des RowClones
+    for current_idx in 0..baseline_history.len() {
+        let mem_access = baseline_history[current_idx];
         if track_active_copies(
-            mem_access,
+            &baseline_history,
+            &mem_access,
             &mut active_copies,
             current_idx,
             &mut valid_indices,
@@ -329,20 +338,15 @@ fn process_single_cpu_trace(
         ) {
             continue;
         }
-        check_potential_copy_start(mem_access, &copy_window, &mut active_copies, current_idx);
+        check_potential_copy_start(&mem_access, &copy_window, &mut active_copies, current_idx);
     }
 
     let detected_rc_count = rowclone_events.len();
-    if detected_rc_count == 0 {
-        eprintln!("[CPU {}] 0 RowClone détecté sur ce cœur.", cpu_id);
-    } else {
-        eprintln!("[CPU {}] Détection : {} RowClones identifiés.", cpu_id, detected_rc_count);
-    }
 
-    // CONSTRUCTION DU MASQUE ROI PAR CLUSTERING
-    let (in_roi, retained_rc_count) = if let Some(max_gap) = cluster_gap {
+    // CONSTRUCTION DU MASQUE ROI
+    let mut in_roi = if let Some(max_gap) = cluster_gap {
         if detected_rc_count == 0 {
-            (vec![false; baseline_history.len()], 0)
+            vec![false; baseline_history.len()]
         } else {
             let mut mask = vec![false; baseline_history.len()];
             let mut valid_clusters: Vec<Vec<RowcloneEvent>> = Vec::new();
@@ -363,13 +367,10 @@ fn process_single_cpu_trace(
                 valid_clusters.push(current_cluster);
             }
 
-            let mut retained_copies = 0;
             for cluster in &valid_clusters {
-                retained_copies += cluster.len();
                 let cluster_start = cluster.first().unwrap().target_global_idx;
                 let cluster_end = cluster.last().unwrap().end_global_idx;
 
-                // Application du rab personnalisé (avant et après)
                 let start = cluster_start.saturating_sub(margin_before);
                 let end = (cluster_end + margin_after).min(baseline_history.len() - 1);
 
@@ -377,31 +378,31 @@ fn process_single_cpu_trace(
                     mask[idx] = true;
                 }
             }
-
-            let kept_count = mask.iter().filter(|&&k| k).count();
-            eprintln!(
-                "[CPU {}] Filtrage actif : {} clusters (>= {} copies, gap <= {}) retenus | Copies: {}/{} ({:.1}%) | Rab: [-{}, +{}] | Accès conservés: {}/{} ({:.2}%)",
-                cpu_id,
-                valid_clusters.len(),
-                min_cluster_copies,
-                max_gap,
-                retained_copies,
-                detected_rc_count,
-                if detected_rc_count > 0 { (retained_copies as f64 * 100.0) / detected_rc_count as f64 } else { 0.0 },
-                margin_before,
-                margin_after,
-                kept_count,
-                total_raw,
-                (kept_count as f64 * 100.0) / (total_raw as f64)
-            );
-            (mask, retained_copies)
+            mask
         }
     } else {
-        // Pas de filtrage spécifié : on conserve toute la trace brute
-        (vec![true; baseline_history.len()], detected_rc_count)
+        vec![true; baseline_history.len()]
     };
 
-    // PASSE 2 : Écriture Ramulator avec compensation exacte des instructions hors-ROI
+    // APPLICATION DU FILTRAGE TTBR0 (intersecte le masque ROI s'il existe)
+    if let Some(allowed_pfns) = allowed_ttbr0_pfns {
+        for (idx, rec) in baseline_history.iter().enumerate() {
+            if in_roi[idx] && !allowed_pfns.contains(&rec.ttbr0_pfn) {
+                in_roi[idx] = false;
+            }
+        }
+    }
+
+    let kept_count = in_roi.iter().filter(|&&k| k).count();
+    eprintln!(
+        "[CPU {}] Filtrage appliqué : {}/{} accès conservés ({:.2}%).",
+        cpu_id,
+        kept_count,
+        total_raw,
+        if total_raw > 0 { (kept_count as f64 * 100.0) / (total_raw as f64) } else { 0.0 }
+    );
+
+    // PASSE 2 : Écriture Ramulator avec compensation exacte du compteur d'instructions
     let baseline_out_path = post_log_dir.join(format!("cpu_{}.trace", cpu_id));
     let rowclone_out_path = post_log_rc_dir.join(format!("cpu_{}.trace", cpu_id));
 
@@ -425,14 +426,12 @@ fn process_single_cpu_trace(
         let delta_insn = mem_access.insn_count.saturating_sub(prev_raw_insn);
         prev_raw_insn = mem_access.insn_count;
 
-        // Si hors des clusters retenus : on purge l'accès et on compense son delta d'instructions
         if !in_roi[idx] {
             cumulated_skipped_insns += delta_insn;
             continue;
         }
 
-        // Accès conservé : insn_count réaligné pour effacer les temps morts hors cluster
-        let mut adj_access = mem_access.clone();
+        let mut adj_access = *mem_access;
         adj_access.insn_count = adj_access.insn_count.saturating_sub(cumulated_skipped_insns);
 
         written_accesses += 1;
@@ -463,19 +462,27 @@ fn process_single_cpu_trace(
     rc_fmt.flush()?;
     eprintln!(
         "[CPU {}] Écriture terminée -> RowClones émis: {}/{} | Supprimés: LD={}, ST={} | Accès écrits: {}\n",
-        cpu_id, final_rowclones, retained_rc_count, total_removed_loads, total_removed_stores, written_accesses
+        cpu_id, final_rowclones, detected_rc_count, total_removed_loads, total_removed_stores, written_accesses
     );
     Ok(())
 }
 
 #[derive(Parser, Debug)]
-#[command(about = "Traitement parallèle des traces CPU avec clusters et marges personnalisées")]
+#[command(about = "Traitement des traces CPU pour Ramulator avec filtrage par TTBR0 et clustering")]
 struct Args {
     #[arg(short, long)]
     log_dir: String,
 
     #[arg(short, long)]
     kernel_logfile: String,
+
+    /// Ne conserver que les TTBR0 qui contiennent au moins une copie RowClone
+    #[arg(long)]
+    only_rc_ttbr0: bool,
+
+    /// Filtrer sur un TTBR0 spécifique en hexadécimal (ex: 0x2da563000)
+    #[arg(long)]
+    specific_ttbr0: Option<String>,
 
     /// Écart maximal en accès entre deux copies pour former un cluster (ex: 10000)
     #[arg(long)]
@@ -489,11 +496,11 @@ struct Args {
     #[arg(long)]
     roi_margin: Option<usize>,
 
-    /// Rab spécifique AVANT le cluster (prioritaire sur --roi-margin)
+    /// Rab spécifique AVANT le cluster
     #[arg(long)]
     margin_before: Option<usize>,
 
-    /// Rab spécifique APRÈS le cluster (prioritaire sur --roi-margin)
+    /// Rab spécifique APRÈS le cluster
     #[arg(long)]
     margin_after: Option<usize>,
 }
@@ -505,7 +512,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(post_log_dir)?;
     fs::create_dir_all(post_log_rc_dir)?;
 
-    // Résolution des marges avant / après
     let default_margin = args.roi_margin.unwrap_or(0);
     let m_before = args.margin_before.unwrap_or(default_margin);
     let m_after = args.margin_after.unwrap_or(default_margin);
@@ -519,7 +525,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let trace_files: Vec<PathBuf> = fs::read_dir(&args.log_dir)?
+    let mut trace_files: Vec<PathBuf> = fs::read_dir(&args.log_dir)?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| {
@@ -530,8 +536,80 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
 
+    trace_files.sort();
+
+    // Détermination de l'ensemble des TTBR0 autorisés
+    let allowed_ttbr0_pfns: Option<HashSet<u32>> = if let Some(ref specific_hex) = args.specific_ttbr0 {
+        let ttbr0_val = parse_hex_address(specific_hex)
+            .ok_or("Format d'adresse hexadécimale invalide pour --specific-ttbr0")?;
+        let pfn = (ttbr0_val >> 12) as u32;
+        eprintln!(
+            "--- FILTRAGE ACTIF : TTBR0 spécifique 0x{:016x} (PFN: 0x{:08x}) uniquement ---",
+            ttbr0_val, pfn
+        );
+        let mut set = HashSet::new();
+        set.insert(pfn);
+        Some(set)
+    } else if args.only_rc_ttbr0 {
+        eprintln!("--- RECHERCHE GLOBALE DES TTBR0 CONTENANT DES ROWCLONES ---");
+        let rc_pfns: HashSet<u32> = trace_files
+            .par_iter()
+            .map(|trace_path| {
+                let mut local_pfns = HashSet::new();
+                if let Ok(mut parser) = LogParser::new(trace_path.to_str().unwrap()) {
+                    let mut records = Vec::new();
+                    while let Some(Ok(rec)) = parser.next() {
+                        records.push(rec);
+                    }
+                    if !records.is_empty() {
+                        let cpu_id = records[0].cpu as u8;
+                        let cpu_records = kernel_by_cpu.get(&cpu_id).cloned().unwrap_or_default();
+                        let mut kernel_iter = cpu_records.into_iter();
+                        let mut copy_window: Vec<KernelRecord> = kernel_iter.by_ref().take(COPY_WINDOW).collect();
+                        let mut active_copies = Vec::new();
+                        let mut valid_indices = vec![false; records.len()];
+                        let mut rowclone_events = Vec::new();
+
+                        for idx in 0..records.len() {
+                            let mem_access = records[idx];
+                            if track_active_copies(
+                                &records,
+                                &mem_access,
+                                &mut active_copies,
+                                idx,
+                                &mut valid_indices,
+                                &mut rowclone_events,
+                                &mut copy_window,
+                                &mut kernel_iter,
+                            ) {
+                                continue;
+                            }
+                            check_potential_copy_start(&mem_access, &copy_window, &mut active_copies, idx);
+                        }
+
+                        for ev in rowclone_events {
+                            local_pfns.insert((ev.ttbr0 >> 12) as u32);
+                        }
+                    }
+                }
+                local_pfns
+            })
+            .reduce(HashSet::new, |mut acc, item| {
+                acc.extend(item);
+                acc
+            });
+
+        eprintln!("TTBR0 avec RowClones découverts ({} processus) :", rc_pfns.len());
+        for pfn in &rc_pfns {
+            eprintln!("  -> 0x{:016x} (PFN: 0x{:08x})", (*pfn as u64) << 12, pfn);
+        }
+        Some(rc_pfns)
+    } else {
+        None
+    };
+
     eprintln!(
-        "{} traces trouvées. Configuration : cluster_gap={:?}, min_copies={}, rab=[-{}, +{}]\n",
+        "\n{} traces trouvées. Exécution avec cluster_gap={:?}, min_copies={}, rab=[-{}, +{}]\n",
         trace_files.len(),
         args.cluster_gap,
         args.min_copies,
@@ -541,10 +619,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let gap = args.cluster_gap;
     let min_c = args.min_copies;
+    let allowed_ref = allowed_ttbr0_pfns.as_ref();
+
     trace_files.par_iter().for_each(|trace_path| {
         if let Ok(mut p) = LogParser::new(trace_path.to_str().unwrap()) {
             if let Some(Ok(first_rec)) = p.next() {
-                let cpu_records = kernel_by_cpu.get(&first_rec.cpu).cloned().unwrap_or_default();
+                let cpu_records = kernel_by_cpu.get(&(first_rec.cpu as u8)).cloned().unwrap_or_default();
                 if let Err(e) = process_single_cpu_trace(
                     trace_path,
                     cpu_records,
@@ -554,6 +634,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     min_c,
                     m_before,
                     m_after,
+                    allowed_ref,
                 ) {
                     eprintln!("[ERREUR] Échec sur {:?} : {}", trace_path, e);
                 }
@@ -561,7 +642,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    eprintln!("Traitement terminé avec succès !");
-    eprintln!("Dossiers générés : post_log/ et post_log_rowclone/");
+    eprintln!("\nTraitement terminé avec succès !");
+    eprintln!("Fichiers générés dans : post_log/ et post_log_rowclone/");
     Ok(())
 }

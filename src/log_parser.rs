@@ -8,10 +8,11 @@ use std::mem;
 pub struct LogRecord {
     pub insn_count: u64,
     pub address: u64,
+    pub ttbr0_pfn: u32,
     pub cpu: u8,
     pub store: u8,
     pub size: u8,
-    pub _padding: [u8; 5],
+    pub _padding: u8,
 }
 
 impl LogRecord {
